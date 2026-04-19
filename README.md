@@ -3,7 +3,7 @@
 ```
 liquidity-stress-early-warning/
 │
-├── .github/                    # CI/CD workflows (later phase)
+├── .github/                    # CI/CD workflows 
 │
 ├── configs/                   # Configuration files (YAML)
 │   ├── config.yaml
@@ -14,10 +14,10 @@ liquidity-stress-early-warning/
 │   ├── interim/               # Cleaned but not final
 │   └── processed/             # Final modeling data
 │
-├── notebooks/                 # EDA notebooks (NOT production code)
+├── notebooks/                 # experimental notebooks 
 │   └── eda.ipynb
 │
-├── src/                       # Core source code (THIS IS THE HEART)
+├── src/                       # Core source code 
 │   ├── __init__.py
 │   │
 │   ├── data/
@@ -41,7 +41,7 @@ liquidity-stress-early-warning/
 │   │   ├── logger.py
 │   │   └── helpers.py
 │
-├── tests/                     # Unit tests (optional but senior-level)
+├── tests/                     # Unit tests 
 │
 ├── artifacts/                 # Saved models, transformers
 │
