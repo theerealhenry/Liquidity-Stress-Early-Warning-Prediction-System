@@ -2,31 +2,32 @@
 Data Loading & Initial Validation Module
 ======================================
 
-This module provides a single source of truth for loading and performing
-lightweight validation on raw datasets (train/test).
+Enhanced Version:
+- Strong validation 
+- Memory optimization
+- Train/Test schema alignment checks
+- Target diagnostics
+- Missing/zero-heavy feature detection
 
 Design Principles:
 - Reproducibility
-- Consistency across notebooks and pipelines
-- Minimal transformation (NO feature engineering)
-- Early failure on critical data issues
-
+- Early failure on critical issues
+- Zero leakage
+- Pipeline compatibility
 """
 
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional
 
 import pandas as pd
+import numpy as np
 
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
-REQUIRED_COLUMNS = {
-    "ID",
-    "liquidity_stress_next_30d"
-}
+REQUIRED_COLUMNS = {"ID", "liquidity_stress_next_30d"}
 
 CATEGORICAL_COLUMNS = [
     "gender",
@@ -36,10 +37,10 @@ CATEGORICAL_COLUMNS = [
     "smartphone"
 ]
 
-NUMERIC_EXCLUDE_COLUMNS = [
-    "ID",
-    "liquidity_stress_next_30d"
-]
+NUMERIC_EXCLUDE_COLUMNS = ["ID", "liquidity_stress_next_30d"]
+
+HIGH_MISSING_THRESHOLD = 0.4
+HIGH_ZERO_THRESHOLD = 0.8
 
 
 # =========================================================
@@ -52,50 +53,28 @@ def load_data(
     validate: bool = True,
     verbose: bool = True
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """
-    Load train and/or test datasets with standardized preprocessing.
 
-    Parameters
-    ----------
-    train_path : str, optional
-        Path to training dataset
-    test_path : str, optional
-        Path to test dataset
-    validate : bool, default=True
-        Whether to run validation checks
-    verbose : bool, default=True
-        Print dataset summaries
-
-    Returns
-    -------
-    train_df : pd.DataFrame or None
-    test_df : pd.DataFrame or None
-    """
-
-    train_df = _load_single_dataset(train_path, dataset_name="TRAIN", verbose=verbose)
-    test_df = _load_single_dataset(test_path, dataset_name="TEST", verbose=verbose)
+    train_df = _load_single_dataset(train_path, "TRAIN", verbose)
+    test_df = _load_single_dataset(test_path, "TEST", verbose)
 
     if validate:
         if train_df is not None:
-            _validate_dataset(train_df, dataset_name="TRAIN", is_train=True)
+            _validate_dataset(train_df, "TRAIN", is_train=True)
+
         if test_df is not None:
-            _validate_dataset(test_df, dataset_name="TEST", is_train=False)
+            _validate_dataset(test_df, "TEST", is_train=False)
+
+        if train_df is not None and test_df is not None:
+            _check_train_test_consistency(train_df, test_df)
 
     return train_df, test_df
 
 
 # =========================================================
-# INTERNAL HELPERS
+# LOAD SINGLE DATASET
 # =========================================================
 
-def _load_single_dataset(
-    path: Optional[str],
-    dataset_name: str,
-    verbose: bool
-) -> Optional[pd.DataFrame]:
-    """
-    Load a single dataset and apply basic cleaning.
-    """
+def _load_single_dataset(path: Optional[str], dataset_name: str, verbose: bool):
 
     if path is None:
         return None
@@ -107,20 +86,20 @@ def _load_single_dataset(
 
     df = pd.read_csv(path)
 
-    # Standardize column names
+    # Clean column names
     df.columns = [col.strip() for col in df.columns]
 
-    # Basic cleaning
     df = _enforce_dtypes(df)
+    df = _optimize_memory(df)
 
     if verbose:
-        print(f"\n{'='*50}")
-        print(f"{dataset_name} DATA LOADED")
-        print(f"{'='*50}")
+        print(f"\n{'='*60}")
+        print(f"{dataset_name} LOADED")
+        print(f"{'='*60}")
         print(f"Shape: {df.shape}")
-        print(f"Columns: {len(df.columns)}")
+        print(f"Memory usage: {round(df.memory_usage().sum() / 1e6, 2)} MB")
         print(df.dtypes.value_counts())
-        print(f"{'='*50}\n")
+        print(f"{'='*60}\n")
 
     return df
 
@@ -130,18 +109,13 @@ def _load_single_dataset(
 # =========================================================
 
 def _enforce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enforce consistent data types across datasets.
-    """
 
     df = df.copy()
 
-    # Convert categorical columns
     for col in CATEGORICAL_COLUMNS:
         if col in df.columns:
             df[col] = df[col].astype("category")
 
-    # Convert numeric columns
     numeric_cols = [
         col for col in df.columns
         if col not in CATEGORICAL_COLUMNS + NUMERIC_EXCLUDE_COLUMNS
@@ -149,9 +123,23 @@ def _enforce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
-    # Convert target to int (if exists)
     if "liquidity_stress_next_30d" in df.columns:
-        df["liquidity_stress_next_30d"] = df["liquidity_stress_next_30d"].astype("Int64")
+        df["liquidity_stress_next_30d"] = df["liquidity_stress_next_30d"].astype("Int8")
+
+    return df
+
+
+# =========================================================
+# MEMORY OPTIMIZATION
+# =========================================================
+
+def _optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Downcast numeric columns to reduce memory footprint.
+    """
+
+    for col in df.select_dtypes(include=["int", "float"]).columns:
+        df[col] = pd.to_numeric(df[col], downcast="unsigned")
 
     return df
 
@@ -160,73 +148,47 @@ def _enforce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 # VALIDATION
 # =========================================================
 
-def _validate_dataset(
-    df: pd.DataFrame,
-    dataset_name: str,
-    is_train: bool = True
-) -> None:
-    """
-    Run core validation checks.
-    """
+def _validate_dataset(df: pd.DataFrame, dataset_name: str, is_train: bool):
 
-    print(f"🔍 Validating {dataset_name} dataset...")
+    print(f"🔍 Validating {dataset_name}...")
 
-    # 1. Required columns
     _check_required_columns(df, dataset_name, is_train)
-
-    # 2. Duplicate IDs
     _check_duplicate_ids(df, dataset_name)
-
-    # 3. Basic sanity checks
     _check_basic_statistics(df, dataset_name)
+    _check_missing_and_zero(df, dataset_name)
+
+    if is_train:
+        _check_target(df)
 
     print(f"✅ {dataset_name} validation completed.\n")
 
 
-def _check_required_columns(
-    df: pd.DataFrame,
-    dataset_name: str,
-    is_train: bool
-) -> None:
-    """
-    Ensure required columns exist.
-    """
+# =========================================================
+# VALIDATION HELPERS
+# =========================================================
 
-    required = REQUIRED_COLUMNS.copy()
+def _check_required_columns(df, dataset_name, is_train):
 
-    if not is_train:
-        required = {"ID"}  # test set does not have target
+    required = REQUIRED_COLUMNS if is_train else {"ID"}
 
     missing = required - set(df.columns)
 
     if missing:
-        raise ValueError(
-            f"{dataset_name} is missing required columns: {missing}"
-        )
+        raise ValueError(f"{dataset_name} missing columns: {missing}")
 
 
-def _check_duplicate_ids(df: pd.DataFrame, dataset_name: str) -> None:
-    """
-    Check for duplicate IDs.
-    """
+def _check_duplicate_ids(df, dataset_name):
 
-    if "ID" not in df.columns:
-        return
+    if "ID" in df.columns:
+        dup = df["ID"].duplicated().sum()
 
-    duplicates = df["ID"].duplicated().sum()
-
-    if duplicates > 0:
-        raise ValueError(
-            f"{dataset_name} contains {duplicates} duplicate IDs!"
-        )
-    else:
-        print(f"✔ No duplicate IDs in {dataset_name}")
+        if dup > 0:
+            raise ValueError(f"{dataset_name} has {dup} duplicate IDs")
+        else:
+            print(f"✔ No duplicate IDs")
 
 
-def _check_basic_statistics(df: pd.DataFrame, dataset_name: str) -> None:
-    """
-    Basic sanity checks for numerical data.
-    """
+def _check_basic_statistics(df, dataset_name):
 
     numeric_cols = df.select_dtypes(include=["number"]).columns
 
@@ -235,49 +197,74 @@ def _check_basic_statistics(df: pd.DataFrame, dataset_name: str) -> None:
 
     summary = df[numeric_cols].describe().T
 
-    # Detect extreme anomalies (basic check)
-    extreme_values = summary[summary["max"] > 1e9]
+    extreme = summary[summary["max"] > 1e9]
 
-    if not extreme_values.empty:
-        print(f"⚠ Warning: Extreme values detected in {dataset_name}")
-        print(extreme_values[["max"]])
+    if not extreme.empty:
+        print("⚠ Extreme values detected")
 
-    # Check negative values where not expected
-    # Can be extended later with domain-specific rules
+
+def _check_missing_and_zero(df, dataset_name):
+
+    missing = df.isna().mean()
+    high_missing = missing[missing > HIGH_MISSING_THRESHOLD]
+
+    if not high_missing.empty:
+        print("⚠ High missing features:")
+        print(high_missing.sort_values(ascending=False).head(10))
+
+    numeric_df = df.select_dtypes(include=["number"])
+
+    zero_pct = (numeric_df == 0).mean()
+    high_zero = zero_pct[zero_pct > HIGH_ZERO_THRESHOLD]
+
+    if not high_zero.empty:
+        print("⚠ High zero features:")
+        print(high_zero.sort_values(ascending=False).head(10))
+
+
+def _check_target(df):
+
+    target = df["liquidity_stress_next_30d"]
+
+    print("\n🎯 Target Distribution:")
+    print(target.value_counts(normalize=True))
+
+    if not set(target.dropna().unique()).issubset({0, 1}):
+        raise ValueError("Target must be binary (0/1)")
+
+
+def _check_train_test_consistency(train_df, test_df):
+
+    train_cols = set(train_df.columns)
+    test_cols = set(test_df.columns)
+
+    diff = train_cols.symmetric_difference(test_cols)
+
+    if diff:
+        print("⚠ Train/Test column mismatch detected:")
+        print(diff)
 
 
 # =========================================================
-# FEATURE SUMMARY GENERATOR (PHASE 1 ARTIFACT)
+# FEATURE SUMMARY
 # =========================================================
 
 def generate_feature_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Generate feature summary for validation phase.
-
-    Returns DataFrame with:
-    - dtype
-    - missing %
-    - zero %
-    - mean, std, min, max
-    """
 
     summary = []
 
     for col in df.columns:
         col_data = df[col]
 
-        missing_pct = col_data.isna().mean() * 100
-        zero_pct = ((col_data == 0).mean() * 100) if pd.api.types.is_numeric_dtype(col_data) else None
-
         stats = {
             "feature": col,
             "dtype": str(col_data.dtype),
-            "missing_pct": round(missing_pct, 2),
-            "zero_pct": round(zero_pct, 2) if zero_pct is not None else None,
+            "missing_pct": round(col_data.isna().mean() * 100, 2),
         }
 
         if pd.api.types.is_numeric_dtype(col_data):
             stats.update({
+                "zero_pct": round((col_data == 0).mean() * 100, 2),
                 "mean": col_data.mean(),
                 "std": col_data.std(),
                 "min": col_data.min(),
