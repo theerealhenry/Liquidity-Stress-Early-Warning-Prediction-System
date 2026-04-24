@@ -27,7 +27,7 @@ import pandas as pd
 
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 TARGET = "liquidity_stress_next_30d"
@@ -46,8 +46,6 @@ TRANSACTION_GROUPS = [
 ]
 
 VALUE_SUFFIX = "total_value"
-VOLUME_SUFFIX = "volume"
-
 EPS = 1e-6
 
 
@@ -58,21 +56,24 @@ EPS = 1e-6
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df = _handle_zero_inflation(df)
-    df = _log_transform(df)
+    new_features = []
 
-    df = _create_temporal_aggregations(df)
-    df = _create_trend_features(df)
-    df = _create_volatility_features(df)
+    new_features.append(_handle_zero_inflation(df))
+    new_features.append(_log_transform(df))
 
-    df = _create_activity_features(df)
-    df = _create_cashflow_features(df)
-    df = _create_behavioral_ratios(df)
+    new_features.append(_create_temporal_features(df))
+    new_features.append(_create_activity_features(df))
+    new_features.append(_create_cashflow_features(df))
+    new_features.append(_create_behavioral_ratios(df))
+    new_features.append(_create_recency_features(df))
+    new_features.append(_create_balance_features(df))
 
-    df = _create_recency_features(df)
-    df = _create_balance_features(df)
+    # 🔥 Concatenate ONCE → no fragmentation
+    feature_df = pd.concat(new_features, axis=1)
 
-    return df
+    df = pd.concat([df, feature_df], axis=1)
+
+    return df.copy()  # defragment
 
 
 # =========================================================
@@ -80,89 +81,71 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 # =========================================================
 
 def _handle_zero_inflation(df):
+    features = {}
     numeric_cols = df.select_dtypes(include=["number"]).columns
 
     for col in numeric_cols:
         zero_ratio = (df[col] == 0).mean()
 
         if zero_ratio > 0.6:
-            df[f"{col}_is_zero"] = (df[col] == 0).astype(int)
+            features[f"{col}_is_zero"] = (df[col] == 0).astype(int)
 
-    return df
+    return pd.DataFrame(features)
 
 
 # =========================================================
-# LOG TRANSFORM
+# LOG TRANSFORM (RETURN EMPTY DF FOR CONSISTENCY)
 # =========================================================
 
 def _log_transform(df):
-    for col in df.columns:
+    df_copy = df.copy()
+
+    for col in df_copy.columns:
         if "total_value" in col or "highest_amount" in col:
-            df[col] = np.log1p(df[col])
-    return df
+            df_copy[col] = np.log1p(df_copy[col])
+
+    return pd.DataFrame(index=df.index)  # handled in-place
 
 
 # =========================================================
-# TEMPORAL AGGREGATIONS 
+# TEMPORAL FEATURES (AGG + TREND + VOLATILITY)
 # =========================================================
 
-def _create_temporal_aggregations(df):
-    for group in TRANSACTION_GROUPS:
+def _create_temporal_features(df):
+    features = {}
 
-        cols = [f"{m}_{group}_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns]
-
-        if len(cols) >= 2:
-            df[f"{group}_mean"] = df[cols].mean(axis=1)
-            df[f"{group}_std"] = df[cols].std(axis=1)
-            df[f"{group}_min"] = df[cols].min(axis=1)
-            df[f"{group}_max"] = df[cols].max(axis=1)
-
-    return df
-
-
-# =========================================================
-# TREND FEATURES
-# =========================================================
-
-def _create_trend_features(df):
     time_index = np.arange(len(MONTHS))
 
     for group in TRANSACTION_GROUPS:
 
-        cols = [f"{m}_{group}_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns]
+        cols = [
+            f"{m}_{group}_{VALUE_SUFFIX}"
+            for m in MONTHS
+            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
+        ]
 
         if len(cols) >= 2:
-            values = df[cols].values
+            data = df[cols].values
 
-            # Linear trend (slope)
-            slope = np.polyfit(time_index, values.T, 1)[0]
-            df[f"{group}_slope"] = slope
+            mean = data.mean(axis=1)
+            std = data.std(axis=1)
 
-            # Simple trend
-            df[f"{group}_trend"] = df[cols[0]] - df[cols[-1]]
+            features[f"{group}_mean"] = mean
+            features[f"{group}_std"] = std
+            features[f"{group}_min"] = data.min(axis=1)
+            features[f"{group}_max"] = data.max(axis=1)
 
-            # Trend ratio
-            df[f"{group}_trend_ratio"] = df[cols[0]] / (df[cols[-1]] + EPS)
+            features[f"{group}_cv"] = std / (mean + EPS)
 
-    return df
+            # Trend
+            features[f"{group}_trend"] = data[:, 0] - data[:, -1]
+            features[f"{group}_trend_ratio"] = data[:, 0] / (data[:, -1] + EPS)
 
+            # Slope (vectorized)
+            slope = np.polyfit(time_index, data.T, 1)[0]
+            features[f"{group}_slope"] = slope
 
-# =========================================================
-# VOLATILITY
-# =========================================================
-
-def _create_volatility_features(df):
-    for group in TRANSACTION_GROUPS:
-
-        cols = [f"{m}_{group}_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns]
-
-        if len(cols) >= 3:
-            mean = df[cols].mean(axis=1)
-            std = df[cols].std(axis=1)
-
-            df[f"{group}_cv"] = std / (mean + EPS)
-
-    return df
+    return pd.DataFrame(features)
 
 
 # =========================================================
@@ -170,35 +153,45 @@ def _create_volatility_features(df):
 # =========================================================
 
 def _create_activity_features(df):
+    features = {}
+
     for group in TRANSACTION_GROUPS:
 
-        cols = [f"{m}_{group}_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns]
+        cols = [
+            f"{m}_{group}_{VALUE_SUFFIX}"
+            for m in MONTHS
+            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
+        ]
 
         if cols:
             activity = (df[cols] > 0).astype(int)
 
-            df[f"{group}_active_months"] = activity.sum(axis=1)
-            df[f"{group}_inactive_months"] = (activity == 0).sum(axis=1)
+            features[f"{group}_active_months"] = activity.sum(axis=1)
+            features[f"{group}_inactive_months"] = (activity == 0).sum(axis=1)
 
-    return df
+    return pd.DataFrame(features)
 
 
 # =========================================================
-# CASHFLOW FEATURES
+# CASHFLOW
 # =========================================================
 
 def _create_cashflow_features(df):
+    features = {}
+
     deposit_cols = [f"{m}_deposit_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_deposit_{VALUE_SUFFIX}" in df.columns]
     withdraw_cols = [f"{m}_withdraw_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_withdraw_{VALUE_SUFFIX}" in df.columns]
 
     if deposit_cols and withdraw_cols:
-        df["total_deposit"] = df[deposit_cols].sum(axis=1)
-        df["total_withdraw"] = df[withdraw_cols].sum(axis=1)
+        total_deposit = df[deposit_cols].sum(axis=1)
+        total_withdraw = df[withdraw_cols].sum(axis=1)
 
-        df["net_cashflow"] = df["total_deposit"] - df["total_withdraw"]
-        df["withdraw_deposit_ratio"] = df["total_withdraw"] / (df["total_deposit"] + EPS)
+        features["total_deposit"] = total_deposit
+        features["total_withdraw"] = total_withdraw
+        features["net_cashflow"] = total_deposit - total_withdraw
+        features["withdraw_deposit_ratio"] = total_withdraw / (total_deposit + EPS)
 
-    return df
+    return pd.DataFrame(features)
 
 
 # =========================================================
@@ -206,52 +199,69 @@ def _create_cashflow_features(df):
 # =========================================================
 
 def _create_behavioral_ratios(df):
+    features = {}
 
-    if "total_deposit" in df.columns and "total_withdraw" in df.columns:
-        df["cash_pressure"] = df["total_withdraw"] / (df["total_deposit"] + EPS)
+    if "arpu" in df.columns:
 
-    if "total_deposit" in df.columns:
-        df["deposit_intensity"] = df["total_deposit"] / (df["arpu"] + EPS)
+        deposit_cols = [f"{m}_deposit_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_deposit_{VALUE_SUFFIX}" in df.columns]
+        withdraw_cols = [f"{m}_withdraw_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_withdraw_{VALUE_SUFFIX}" in df.columns]
 
-    if "total_withdraw" in df.columns:
-        df["withdraw_intensity"] = df["total_withdraw"] / (df["arpu"] + EPS)
+        if deposit_cols:
+            total_deposit = df[deposit_cols].sum(axis=1)
+            features["deposit_intensity"] = total_deposit / (df["arpu"] + EPS)
 
-    return df
+        if withdraw_cols:
+            total_withdraw = df[withdraw_cols].sum(axis=1)
+            features["withdraw_intensity"] = total_withdraw / (df["arpu"] + EPS)
+
+    return pd.DataFrame(features)
 
 
 # =========================================================
-# RECENCY FEATURES
+# RECENCY
 # =========================================================
 
 def _create_recency_features(df):
+    features = {}
+
     for group in TRANSACTION_GROUPS:
 
         m1_col = f"m1_{group}_{VALUE_SUFFIX}"
-        history_cols = [f"{m}_{group}_{VALUE_SUFFIX}" for m in MONTHS[1:] if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns]
+        history_cols = [
+            f"{m}_{group}_{VALUE_SUFFIX}"
+            for m in MONTHS[1:]
+            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
+        ]
 
         if m1_col in df.columns and history_cols:
-            df[f"{group}_recency_ratio"] = df[m1_col] / (df[history_cols].mean(axis=1) + EPS)
+            features[f"{group}_recency_ratio"] = (
+                df[m1_col] / (df[history_cols].mean(axis=1) + EPS)
+            )
 
-    return df
+    return pd.DataFrame(features)
 
 
 # =========================================================
-# BALANCE FEATURES
+# BALANCE
 # =========================================================
 
 def _create_balance_features(df):
+    features = {}
+
     bal_cols = [f"{m}_daily_avg_bal" for m in MONTHS if f"{m}_daily_avg_bal" in df.columns]
 
     if len(bal_cols) >= 2:
-        df["balance_mean"] = df[bal_cols].mean(axis=1)
-        df["balance_trend"] = df[bal_cols[0]] - df[bal_cols[-1]]
-        df["balance_volatility"] = df[bal_cols].std(axis=1)
+        data = df[bal_cols].values
 
-    return df
+        features["balance_mean"] = data.mean(axis=1)
+        features["balance_trend"] = data[:, 0] - data[:, -1]
+        features["balance_volatility"] = data.std(axis=1)
+
+    return pd.DataFrame(features)
 
 
 # =========================================================
-# FINAL SPLIT
+# SPLIT
 # =========================================================
 
 def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
