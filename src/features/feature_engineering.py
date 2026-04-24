@@ -56,44 +56,66 @@ EPS = 1e-6
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Apply log transform FIRST
     df = _log_transform(df)
 
-    new_features = []
-
-    new_features.append(_handle_zero_inflation(df))
-    new_features.append(_create_temporal_features(df))
-    new_features.append(_create_activity_features(df))
-    new_features.append(_create_cashflow_features(df))
-    new_features.append(_create_behavioral_ratios(df))
-    new_features.append(_create_recency_features(df))
-    new_features.append(_create_balance_features(df))
-    new_features.append(_create_interaction_features(df)) 
-    new_features.append(_create_volatility_features(df))    
-    new_features.append(_create_momentum_features(df))
-
-    feature_df = pd.concat(new_features, axis=1)
-
-    df = pd.concat([df, feature_df], axis=1)
-
-    return df.copy()
-
-
-# =========================================================
-# ZERO-INFLATION
-# =========================================================
-
-def _handle_zero_inflation(df):
     features = {}
+
+    # Cache frequently used columns
+    cache = _build_cache(df)
+
+    features.update(_zero_indicators(df))
+    features.update(_temporal_features(cache))
+    features.update(_activity_features(cache))
+    features.update(_cashflow_features(cache))
+    features.update(_behavioral_ratios(df, cache))
+    features.update(_recency_features(cache))
+    features.update(_balance_features(df))
+    features.update(_volatility_features(cache))
+    features.update(_momentum_features(cache))
+    features.update(_interaction_features(cache))
+
+    feature_df = pd.DataFrame(features, index=df.index)
+
+    return pd.concat([df, feature_df], axis=1)
+
+
+# =========================================================
+# CACHE 
+# =========================================================
+
+def _build_cache(df):
+    cache = {}
+
+    for group in TRANSACTION_GROUPS:
+        cols = [f"{m}_{group}_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns]
+
+        if cols:
+            data = df[cols].values
+            cache[group] = {
+                "cols": cols,
+                "data": data,
+                "sum": data.sum(axis=1),
+                "mean": data.mean(axis=1),
+                "std": data.std(axis=1),
+            }
+
+    return cache
+
+
+# =========================================================
+# ZERO INDICATORS
+# =========================================================
+
+def _zero_indicators(df):
+    features = {}
+
     numeric_cols = df.select_dtypes(include=["number"]).columns
 
     for col in numeric_cols:
-        zero_ratio = (df[col] == 0).mean()
-
-        if zero_ratio > 0.6:
+        if (df[col] == 0).mean() > 0.6:
             features[f"{col}_is_zero"] = (df[col] == 0).astype(int)
 
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
@@ -111,162 +133,120 @@ def _log_transform(df):
 
 
 # =========================================================
-# SLOPE
+# TEMPORAL FEATURES
 # =========================================================
 
 def _compute_slope(data):
     x = np.arange(data.shape[1])
     x_mean = x.mean()
 
-    slopes = ((data - data.mean(axis=1, keepdims=True)) * (x - x_mean)).sum(axis=1) / (
+    return ((data - data.mean(axis=1, keepdims=True)) * (x - x_mean)).sum(axis=1) / (
         ((x - x_mean) ** 2).sum() + EPS
     )
 
-    return slopes
 
-
-# =========================================================
-# TEMPORAL FEATURES
-# =========================================================
-
-def _create_temporal_features(df):
+def _temporal_features(cache):
     features = {}
 
-    for group in TRANSACTION_GROUPS:
+    for g, v in cache.items():
+        data = v["data"]
 
-        cols = [
-            f"{m}_{group}_{VALUE_SUFFIX}"
-            for m in MONTHS
-            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
-        ]
+        features[f"{g}_mean"] = v["mean"]
+        features[f"{g}_std"] = v["std"]
+        features[f"{g}_min"] = data.min(axis=1)
+        features[f"{g}_max"] = data.max(axis=1)
 
-        if len(cols) >= 2:
-            data = df[cols].values
+        features[f"{g}_cv"] = v["std"] / (v["mean"] + EPS)
 
-            mean = data.mean(axis=1)
-            std = data.std(axis=1)
+        features[f"{g}_trend"] = data[:, -1] - data[:, 0]
+        features[f"{g}_trend_ratio"] = data[:, -1] / (data[:, 0] + EPS)
 
-            features[f"{group}_mean"] = mean
-            features[f"{group}_std"] = std
-            features[f"{group}_min"] = data.min(axis=1)
-            features[f"{group}_max"] = data.max(axis=1)
+        features[f"{g}_slope"] = _compute_slope(data)
+        features[f"{g}_consistency"] = 1 / (v["std"] + EPS)
 
-            features[f"{group}_cv"] = std / (mean + EPS)
-
-            # TREND (old → recent)
-            features[f"{group}_trend"] = data[:, -1] - data[:, 0]
-            features[f"{group}_trend_ratio"] = data[:, -1] / (data[:, 0] + EPS)
-
-            # SLOPE
-            features[f"{group}_slope"] = _compute_slope(data)
-
-            # consistency
-            features[f"{group}_consistency"] = 1 / (std + EPS)
-
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
-# ACTIVITY FEATURES
+# ACTIVITY
 # =========================================================
 
-def _create_activity_features(df):
+def _activity_features(cache):
     features = {}
 
-    for group in TRANSACTION_GROUPS:
+    for g, v in cache.items():
+        activity = (v["data"] > 0).astype(int)
 
-        cols = [
-            f"{m}_{group}_{VALUE_SUFFIX}"
-            for m in MONTHS
-            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
-        ]
+        features[f"{g}_active_months"] = activity.sum(axis=1)
+        features[f"{g}_inactive_months"] = (activity == 0).sum(axis=1)
 
-        if cols:
-            activity = (df[cols] > 0).astype(int)
-
-            features[f"{group}_active_months"] = activity.sum(axis=1)
-            features[f"{group}_inactive_months"] = (activity == 0).sum(axis=1)
-
-            # activity change
-            features[f"{group}_activity_change"] = activity.iloc[:, 0] - activity.iloc[:, -1]
-
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
 # CASHFLOW
 # =========================================================
 
-def _create_cashflow_features(df):
+def _cashflow_features(cache):
     features = {}
 
-    deposit_cols = [f"{m}_deposit_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_deposit_{VALUE_SUFFIX}" in df.columns]
-    withdraw_cols = [f"{m}_withdraw_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_withdraw_{VALUE_SUFFIX}" in df.columns]
+    if "deposit" in cache and "withdraw" in cache:
+        d = cache["deposit"]["sum"]
+        w = cache["withdraw"]["sum"]
 
-    if deposit_cols and withdraw_cols:
-        total_deposit = df[deposit_cols].sum(axis=1)
-        total_withdraw = df[withdraw_cols].sum(axis=1)
+        features["total_deposit"] = d
+        features["total_withdraw"] = w
+        features["net_cashflow"] = d - w
+        features["withdraw_deposit_ratio"] = w / (d + EPS)
 
-        features["total_deposit"] = total_deposit
-        features["total_withdraw"] = total_withdraw
-        features["net_cashflow"] = total_deposit - total_withdraw
-        features["withdraw_deposit_ratio"] = total_withdraw / (total_deposit + EPS)
+        features["cashflow_stability"] = (d - w) / (np.abs(d) + np.abs(w) + EPS)
 
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
 # BEHAVIORAL RATIOS
 # =========================================================
 
-def _create_behavioral_ratios(df):
+def _behavioral_ratios(df, cache):
     features = {}
 
-    if "arpu" in df.columns:
+    if "deposit" in cache and "withdraw" in cache:
+        d = cache["deposit"]["sum"]
+        w = cache["withdraw"]["sum"]
 
-        deposit_cols = [f"{m}_deposit_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_deposit_{VALUE_SUFFIX}" in df.columns]
-        withdraw_cols = [f"{m}_withdraw_{VALUE_SUFFIX}" for m in MONTHS if f"{m}_withdraw_{VALUE_SUFFIX}" in df.columns]
+        features["cash_pressure"] = w / (d + EPS)
 
-        if deposit_cols:
-            total_deposit = df[deposit_cols].sum(axis=1)
-            features["deposit_intensity"] = total_deposit / (df["arpu"] + EPS)
+    if "arpu" in df.columns and "deposit" in cache:
+        features["deposit_intensity"] = cache["deposit"]["sum"] / (df["arpu"] + EPS)
 
-        if withdraw_cols:
-            total_withdraw = df[withdraw_cols].sum(axis=1)
-            features["withdraw_intensity"] = total_withdraw / (df["arpu"] + EPS)
-
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
 # RECENCY
 # =========================================================
 
-def _create_recency_features(df):
+def _recency_features(cache):
     features = {}
 
-    for group in TRANSACTION_GROUPS:
+    for g, v in cache.items():
+        data = v["data"]
 
-        m1_col = f"m1_{group}_{VALUE_SUFFIX}"
-        history_cols = [
-            f"{m}_{group}_{VALUE_SUFFIX}"
-            for m in MONTHS[1:]
-            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
-        ]
+        if data.shape[1] >= 3:
+            recent = data[:, :3].mean(axis=1)
+            past = data[:, 3:].mean(axis=1)
 
-        if m1_col in df.columns and history_cols:
-            features[f"{group}_recency_ratio"] = (
-                df[m1_col] / (df[history_cols].mean(axis=1) + EPS)
-            )
+            features[f"{g}_recency_ratio"] = recent / (past + EPS)
 
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
-# BALANCE (FIXED TREND)
+# BALANCE
 # =========================================================
 
-def _create_balance_features(df):
+def _balance_features(df):
     features = {}
 
     bal_cols = [f"{m}_daily_avg_bal" for m in MONTHS if f"{m}_daily_avg_bal" in df.columns]
@@ -278,66 +258,59 @@ def _create_balance_features(df):
         features["balance_trend"] = data[:, -1] - data[:, 0]
         features["balance_volatility"] = data.std(axis=1)
 
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
-# INTERACTION FEATURES
+# VOLATILITY CHANGE
 # =========================================================
 
-def _create_interaction_features(df):
+def _volatility_features(cache):
     features = {}
 
-    if "total_deposit" in df.columns and "withdraw_deposit_ratio" in df.columns:
-        features["deposit_withdraw_interaction"] = (
-            df["total_deposit"] * df["withdraw_deposit_ratio"]
-        )
+    for g, v in cache.items():
+        data = v["data"]
 
-    return pd.DataFrame(features)
+        if data.shape[1] >= 4:
+            recent = data[:, :3].std(axis=1)
+            past = data[:, 3:].std(axis=1)
+
+            features[f"{g}_volatility_ratio"] = recent / (past + EPS)
+
+    return features
 
 
 # =========================================================
-# VOLATILITY CHANGE FEATURES
+# MOMENTUM
 # =========================================================
 
-def _create_volatility_features(df):
+def _momentum_features(cache):
     features = {}
 
-    for group in TRANSACTION_GROUPS:
+    for g, v in cache.items():
+        data = v["data"]
 
-        cols = [
-            f"{m}_{group}_{VALUE_SUFFIX}"
-            for m in MONTHS
-            if f"{m}_{group}_{VALUE_SUFFIX}" in df.columns
-        ]
+        if data.shape[1] >= 2:
+            features[f"{g}_momentum"] = data[:, -1] - data[:, -2]
 
-        if len(cols) >= 4:
-            data = df[cols].values
-
-            recent_std = data[:, :3].std(axis=1)
-            past_std = data[:, 3:].std(axis=1)
-
-            features[f"{group}_volatility_ratio"] = recent_std / (past_std + EPS)
-
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
-# MOMENTUM FEATURES
+# INTERACTIONS
 # =========================================================
 
-def _create_momentum_features(df):
+def _interaction_features(cache):
     features = {}
 
-    for group in TRANSACTION_GROUPS:
+    if "deposit" in cache and "withdraw" in cache:
+        d = cache["deposit"]["sum"]
+        w = cache["withdraw"]["sum"]
 
-        m1 = f"m1_{group}_{VALUE_SUFFIX}"
-        m2 = f"m2_{group}_{VALUE_SUFFIX}"
+        features["deposit_withdraw_interaction"] = d * w
+        features["net_flow_ratio"] = (d - w) / (d + w + EPS)
 
-        if m1 in df.columns and m2 in df.columns:
-            features[f"{group}_momentum"] = df[m1] - df[m2]
-
-    return pd.DataFrame(features)
+    return features
 
 
 # =========================================================
