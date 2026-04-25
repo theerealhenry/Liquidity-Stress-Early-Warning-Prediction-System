@@ -1,21 +1,14 @@
 """
-Preprocessing Pipeline (Production-Grade)
-======================================
+Preprocessing Pipeline (Optimized)
+====================================================
 
-Responsibilities:
-- Column alignment (train vs inference consistency)
-- Missing value handling
-- Type enforcement (safe)
-- Numerical stability (inf/NaN)
-- Robust outlier clipping
-- Memory optimization
-- CV-safe transformations
-
-Design Principles:
-- Deterministic
-- Modular
-- Leakage-safe
-- Robust to schema drift
+Key Improvements:
+- Robust dtype enforcement
+- Safe column alignment
+- Smart clipping (continuous only)
+- NaN handling (before + after)
+- Constant feature removal
+- Fully CV-safe
 """
 
 from typing import List, Optional
@@ -33,11 +26,11 @@ ID_COL = "ID"
 # =========================================================
 
 def validate_schema(df: pd.DataFrame):
-    if df.empty:
-        raise ValueError("Input dataframe is empty")
-
     if not isinstance(df, pd.DataFrame):
         raise TypeError("Input must be a pandas DataFrame")
+
+    if df.empty:
+        raise ValueError("Input dataframe is empty")
 
 
 # =========================================================
@@ -69,8 +62,9 @@ class PreprocessingPipeline:
         self.feature_list = feature_list
         self.clip_quantiles = clip_quantiles
 
-        self.clip_values_ = None
-        self.numeric_cols_ = None
+        self.clip_values_ = {}
+        self.numeric_cols_ = []
+        self.clip_cols_ = []
 
 
     # =====================================================
@@ -79,31 +73,42 @@ class PreprocessingPipeline:
 
     def fit(self, df: pd.DataFrame):
         validate_schema(df)
-
         df = df.copy()
 
-        # Remove non-feature columns safely
-        exclude_cols = [c for c in [TARGET, ID_COL] if c in df.columns]
-        df = df.drop(columns=exclude_cols, errors="ignore")
+        # Drop non-feature columns
+        df = df.drop(columns=[TARGET, ID_COL], errors="ignore")
 
         # Store feature list
         if self.feature_list is None:
             self.feature_list = df.columns.tolist()
 
-        # Identify numeric columns
-        self.numeric_cols_ = df.select_dtypes(include=np.number).columns.tolist()
+        # Force numeric conversion
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Learn clipping thresholds
+        self.numeric_cols_ = df.columns.tolist()
+
+        # Handle NaNs BEFORE learning clipping
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df[self.numeric_cols_] = df[self.numeric_cols_].fillna(0)
+
+        # Learn clipping ONLY for continuous features
         if self.clip_quantiles:
             lower_q, upper_q = self.clip_quantiles
 
-            self.clip_values_ = {}
             for col in self.numeric_cols_:
+                unique_vals = df[col].nunique()
+
+                # Skip binary / low-cardinality features
+                if unique_vals <= 10:
+                    continue
+
                 low = df[col].quantile(lower_q)
                 high = df[col].quantile(upper_q)
 
                 if pd.notnull(low) and pd.notnull(high) and low < high:
                     self.clip_values_[col] = (low, high)
+                    self.clip_cols_.append(col)
 
         return self
 
@@ -114,31 +119,39 @@ class PreprocessingPipeline:
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         validate_schema(df)
-
         df = df.copy()
 
-        # Remove non-feature columns
+        # Drop non-feature columns
         df = df.drop(columns=[TARGET, ID_COL], errors="ignore")
 
-        # Align columns
+        # Align columns FIRST
         df = self._align_columns(df)
+
+        # Force numeric conversion
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
         # Replace inf
         df = df.replace([np.inf, -np.inf], np.nan)
 
-        # Clip safely
-        if self.clip_values_:
-            for col, (low, high) in self.clip_values_.items():
-                if col in df.columns:
-                    df[col] = df[col].clip(lower=low, upper=high)
-
-        # Fill NaNs
+        # Fill NaNs BEFORE clipping
         df[self.numeric_cols_] = df[self.numeric_cols_].fillna(0)
+
+        # Apply clipping safely
+        for col in self.clip_cols_:
+            if col in df.columns:
+                low, high = self.clip_values_[col]
+                df[col] = df[col].clip(lower=low, upper=high)
+
+        # Final NaN safety
+        df[self.numeric_cols_] = df[self.numeric_cols_].fillna(0)
+
+        # Remove constant columns (important post-alignment)
+        nunique = df.nunique()
+        df = df.loc[:, nunique > 1]
 
         # Memory optimization
         df = optimize_memory_usage(df)
-
-        print(f"[Preprocessing] Output shape: {df.shape}")
 
         return df
 
@@ -166,7 +179,7 @@ class PreprocessingPipeline:
         if extra_cols:
             df = df.drop(columns=list(extra_cols))
 
-        # Order columns
+        # Enforce ordering
         df = df[self.feature_list]
 
         return df
