@@ -1,0 +1,167 @@
+# =========================================================
+# PROJECT CONFIGURATION
+# =========================================================
+
+project:
+  name: liquidity_stress_early_warning
+  version: v1_baseline
+  seed: 42
+  n_jobs: -1
+
+
+# =========================================================
+# DATA CONFIGURATION
+# =========================================================
+
+data:
+  train_path: data/processed/train.csv
+  test_path: data/processed/test.csv
+
+  target: liquidity_stress_next_30d
+  id_column: ID
+
+  # Optional (future use)
+  time_column: null
+
+
+# =========================================================
+# FEATURE CONFIGURATION
+# =========================================================
+
+features:
+  drop_columns:
+    - ID
+    - liquidity_stress_next_30d
+
+  use_all_features: true
+
+  # Optional future feature selection
+  selection:
+    enabled: false
+    method: null   # options: "importance", "correlation", "shap"
+    top_k: null
+
+
+# =========================================================
+# PREPROCESSING CONFIGURATION
+# =========================================================
+
+preprocessing:
+  clip_quantiles: [0.001, 0.999]
+  fillna_value: 0
+  enforce_numeric: true
+  remove_constant: true
+  optimize_memory: true
+
+
+# =========================================================
+# CROSS VALIDATION CONFIGURATION
+# =========================================================
+
+cv:
+  n_splits: 5
+  shuffle: true
+  stratified: true
+
+  # Optional advanced CV (future)
+  group_column: null
+  time_series: false
+
+
+# =========================================================
+# MODEL CONFIGURATION (LIGHTGBM BASELINE)
+# =========================================================
+
+model:
+  name: lightgbm
+
+  params:
+    objective: binary
+    metric: ["binary_logloss", "auc"]
+
+    boosting_type: gbdt
+
+    learning_rate: 0.03
+    n_estimators: 1500
+
+    num_leaves: 64
+    max_depth: -1
+
+    min_child_samples: 50
+    min_child_weight: 1e-3
+
+    subsample: 0.8
+    subsample_freq: 1
+
+    colsample_bytree: 0.8
+
+    reg_alpha: 0.5
+    reg_lambda: 1.0
+
+    max_bin: 255
+
+    scale_pos_weight: 5.5   # approx (neg/pos ≈ 27200 / 4800)
+
+    verbosity: -1
+    random_state: 42
+    n_jobs: -1
+
+
+# =========================================================
+# TRAINING CONFIGURATION
+# =========================================================
+
+training:
+  early_stopping_rounds: 100
+  verbose_eval: 100
+
+  save_model: true
+  save_oof: true
+  save_feature_importance: true
+
+  output_dir: outputs/baseline/
+
+
+# =========================================================
+# EVALUATION CONFIGURATION
+# =========================================================
+
+evaluation:
+  primary_metric: logloss
+
+  metrics:
+    logloss:
+      weight: 0.6
+      direction: minimize
+
+    roc_auc:
+      weight: 0.4
+      direction: maximize
+
+  threshold_optimization:
+    enabled: false   # future (for classification threshold tuning)
+
+
+# =========================================================
+# OUTPUT / ARTIFACTS
+# =========================================================
+
+artifacts:
+  save_predictions: true
+  save_oof_predictions: true
+  save_models: true
+  save_config_copy: true
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging:
+  level: INFO
+  log_to_file: true
+  log_dir: logs/
+
+  track_feature_count: true
+  track_memory: true
+  track_cv_scores: true
