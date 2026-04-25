@@ -1,14 +1,16 @@
 """
-Preprocessing Pipeline (Optimized)
+Preprocessing Pipeline (Final)
 ====================================================
 
-Key Improvements:
-- Robust dtype enforcement
-- Safe column alignment
-- Smart clipping (continuous only)
-- NaN handling (before + after)
-- Constant feature removal
-- Fully CV-safe
+Key Features:
+- Strict feature contract enforcement
+- CV-safe transformations
+- Robust clipping (continuous only, unbiased)
+- Stable column alignment
+- Constant feature handling (fit-time only)
+- Defensive assertions
+- Memory optimization
+- Debug visibility
 """
 
 from typing import List, Optional
@@ -58,13 +60,17 @@ class PreprocessingPipeline:
         self,
         feature_list: Optional[List[str]] = None,
         clip_quantiles: Optional[tuple] = (0.001, 0.999),
+        enable_clipping: bool = True,
+        debug: bool = True,
     ):
         self.feature_list = feature_list
         self.clip_quantiles = clip_quantiles
+        self.enable_clipping = enable_clipping
+        self.debug = debug
 
         self.clip_values_ = {}
-        self.numeric_cols_ = []
         self.clip_cols_ = []
+        self.constant_cols_ = []
 
 
     # =====================================================
@@ -82,33 +88,45 @@ class PreprocessingPipeline:
         if self.feature_list is None:
             self.feature_list = df.columns.tolist()
 
-        # Force numeric conversion
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Convert to numeric safely
+        df = df.apply(pd.to_numeric, errors="coerce")
 
-        self.numeric_cols_ = df.columns.tolist()
-
-        # Handle NaNs BEFORE learning clipping
+        # Replace inf BEFORE stats
         df = df.replace([np.inf, -np.inf], np.nan)
-        df[self.numeric_cols_] = df[self.numeric_cols_].fillna(0)
 
-        # Learn clipping ONLY for continuous features
-        if self.clip_quantiles:
+        # -----------------------------------------------
+        # CONSTANT COLUMN DETECTION (FIT ONLY)
+        # -----------------------------------------------
+        nunique = df.nunique(dropna=True)
+        self.constant_cols_ = nunique[nunique <= 1].index.tolist()
+
+        # Remove constants BEFORE learning clipping
+        df = df.drop(columns=self.constant_cols_, errors="ignore")
+
+        # -----------------------------------------------
+        # CLIPPING (UNBIASED)
+        # -----------------------------------------------
+        if self.enable_clipping and self.clip_quantiles:
             lower_q, upper_q = self.clip_quantiles
 
-            for col in self.numeric_cols_:
-                unique_vals = df[col].nunique()
+            for col in df.columns:
+                series = df[col]
 
-                # Skip binary / low-cardinality features
-                if unique_vals <= 10:
+                # Skip low-cardinality features
+                if series.nunique(dropna=True) <= 10:
                     continue
 
-                low = df[col].quantile(lower_q)
-                high = df[col].quantile(upper_q)
+                low = series.quantile(lower_q)
+                high = series.quantile(upper_q)
 
                 if pd.notnull(low) and pd.notnull(high) and low < high:
                     self.clip_values_[col] = (low, high)
                     self.clip_cols_.append(col)
+
+        if self.debug:
+            print(f"[FIT] Features: {len(self.feature_list)}")
+            print(f"[FIT] Constant columns removed: {len(self.constant_cols_)}")
+            print(f"[FIT] Clipping columns: {len(self.clip_cols_)}")
 
         return self
 
@@ -127,31 +145,49 @@ class PreprocessingPipeline:
         # Align columns FIRST
         df = self._align_columns(df)
 
-        # Force numeric conversion
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Convert to numeric
+        df = df.apply(pd.to_numeric, errors="coerce")
 
         # Replace inf
         df = df.replace([np.inf, -np.inf], np.nan)
 
         # Fill NaNs BEFORE clipping
-        df[self.numeric_cols_] = df[self.numeric_cols_].fillna(0)
+        df = df.fillna(0)
 
-        # Apply clipping safely
-        for col in self.clip_cols_:
-            if col in df.columns:
-                low, high = self.clip_values_[col]
-                df[col] = df[col].clip(lower=low, upper=high)
+        # -----------------------------------------------
+        # APPLY CLIPPING
+        # -----------------------------------------------
+        if self.enable_clipping:
+            for col, (low, high) in self.clip_values_.items():
+                if col in df.columns:
+                    df[col] = df[col].clip(lower=low, upper=high)
 
         # Final NaN safety
-        df[self.numeric_cols_] = df[self.numeric_cols_].fillna(0)
+        df = df.fillna(0)
 
-        # Remove constant columns (important post-alignment)
-        nunique = df.nunique()
-        df = df.loc[:, nunique > 1]
+        # -----------------------------------------------
+        # DROP CONSTANT COLUMNS (CONSISTENT WITH FIT)
+        # -----------------------------------------------
+        df = df.drop(columns=self.constant_cols_, errors="ignore")
 
-        # Memory optimization
+        # -----------------------------------------------
+        # FINAL FEATURE CONTRACT ENFORCEMENT
+        # -----------------------------------------------
+        expected_cols = [c for c in self.feature_list if c not in self.constant_cols_]
+        df = df[expected_cols]
+
+        # -----------------------------------------------
+        # MEMORY OPTIMIZATION
+        # -----------------------------------------------
         df = optimize_memory_usage(df)
+
+        # -----------------------------------------------
+        # ASSERTIONS (CRITICAL SAFETY)
+        # -----------------------------------------------
+        assert list(df.columns) == expected_cols, "Feature mismatch after preprocessing!"
+
+        if self.debug:
+            print(f"[TRANSFORM] Output shape: {df.shape}")
 
         return df
 
