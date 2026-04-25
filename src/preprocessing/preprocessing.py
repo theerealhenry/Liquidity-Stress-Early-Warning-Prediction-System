@@ -205,18 +205,28 @@ class PreprocessingPipeline:
     # =====================================================
 
     def _align_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Add missing columns
-        missing_cols = set(self.feature_list) - set(df.columns)
-        for col in missing_cols:
-            df[col] = 0
+        # Identify missing and extra columns
+        missing_cols = list(set(self.feature_list) - set(df.columns))
+        extra_cols = list(set(df.columns) - set(self.feature_list))
 
-        # Remove extra columns
-        extra_cols = set(df.columns) - set(self.feature_list)
+        # Drop extra columns first
         if extra_cols:
-            df = df.drop(columns=list(extra_cols))
+            df = df.drop(columns=extra_cols)
 
-        # Enforce ordering
+        # Add missing columns in ONE operation (no fragmentation)
+        if missing_cols:
+            missing_df = pd.DataFrame(
+                0,
+                index=df.index,
+                columns=missing_cols
+            )
+            df = pd.concat([df, missing_df], axis=1)
+
+        # Enforce correct order
         df = df[self.feature_list]
+
+        # Defragment memory (VERY IMPORTANT)
+        df = df.copy()
 
         return df
 
