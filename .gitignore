@@ -41,3 +41,9 @@ mlruns/
 
 # Temporary files
 *.tmp
+
+# Model outputs
+outputs/
+*.npy
+*.pkl
+*.txt
