@@ -14,8 +14,8 @@ project:
 # =========================================================
 
 data:
-  train_path: data/processed/train.csv
-  test_path: data/processed/test.csv
+  train_path: data/raw/Train.csv
+  test_path: data/raw/Test.csv
 
   target: liquidity_stress_next_30d
   id_column: ID
