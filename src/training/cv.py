@@ -35,8 +35,9 @@ import lightgbm as lgb
 # =========================================================
 
 def compute_metrics(y_true, y_pred) -> Dict[str, float]:
+    y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
     return {
-        "logloss": log_loss(y_true, y_pred, eps=1e-15),
+        "logloss": log_loss(y_true, y_pred),
         "roc_auc": roc_auc_score(y_true, y_pred)
     }
 
