@@ -273,9 +273,12 @@ def run_cv(
 # SAVE ARTIFACTS
 # =========================================================
 
-def save_cv_outputs(results: Dict[str, Any], config: Dict[str, Any]):
+def save_cv_outputs(
+    results: Dict[str, Any],
+    config: Dict[str, Any],
+    output_dir: str
+):
 
-    output_dir = config["training"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
     model_name = results["model_name"]
