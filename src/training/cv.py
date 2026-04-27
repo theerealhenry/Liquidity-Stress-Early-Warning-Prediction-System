@@ -1,22 +1,20 @@
 """
-Advanced Cross-Validation Engine (Model-Agnosti)
+Advanced Cross-Validation Engine
 ==================================================================
 
 Capabilities:
 - Stratified K-Fold CV
 - OOF predictions (ensemble-ready)
-- Fold-level + global metrics (LogLoss, ROC-AUC)
-- Supports LightGBM, XGBoost, CatBoost
-- Feature importance aggregation
-- Model persistence
-- Reproducibility artifacts (fold indices, fold predictions)
+- Fold-level + global metrics
+- Multi-model support (LGBM, XGB, CatBoost)
+- Full reproducibility artifacts
+- Experiment tracking compatibility
 
 Design Principles:
-- Fully model-agnostic
-- CV-safe (no leakage)
 - Deterministic
-- Config-driven
+- Model-agnostic
 - Ensemble-ready
+- Clean artifact contract
 """
 
 import os
@@ -28,7 +26,6 @@ from typing import Dict, Any
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss, roc_auc_score
 
-# Models
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
@@ -40,6 +37,7 @@ from catboost import CatBoostClassifier
 
 def compute_metrics(y_true, y_pred) -> Dict[str, float]:
     y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
+
     return {
         "logloss": float(log_loss(y_true, y_pred)),
         "roc_auc": float(roc_auc_score(y_true, y_pred))
@@ -51,6 +49,7 @@ def compute_metrics(y_true, y_pred) -> Dict[str, float]:
 # =========================================================
 
 def get_model(model_name: str, params: Dict[str, Any]):
+
     if model_name == "lightgbm":
         return lgb.LGBMClassifier(**params)
 
@@ -105,14 +104,11 @@ def train_model(model, model_name, X_train, y_train, X_valid, y_valid, training_
 
 
 # =========================================================
-# PREDICTION SAFE HANDLER
+# SAFE PREDICTION
 # =========================================================
 
 def predict_proba_safe(model, model_name, X):
-    if model_name in ["lightgbm", "xgboost", "catboost"]:
-        return model.predict_proba(X)[:, 1]
-    else:
-        raise ValueError(f"Unsupported model: {model_name}")
+    return model.predict_proba(X)[:, 1]
 
 
 # =========================================================
@@ -121,13 +117,17 @@ def predict_proba_safe(model, model_name, X):
 
 def get_feature_importance(model, model_name, feature_names):
 
-    if model_name in ["lightgbm", "xgboost"]:
-        importance = model.feature_importances_
+    try:
+        if model_name in ["lightgbm", "xgboost"]:
+            importance = model.feature_importances_
 
-    elif model_name == "catboost":
-        importance = model.get_feature_importance()
+        elif model_name == "catboost":
+            importance = model.get_feature_importance()
 
-    else:
+        else:
+            importance = np.zeros(len(feature_names))
+
+    except Exception:
         importance = np.zeros(len(feature_names))
 
     return pd.DataFrame({
@@ -144,8 +144,8 @@ def run_cv(
     X: pd.DataFrame,
     y: pd.Series,
     config: Dict[str, Any],
-    return_fold_indices: bool = False,
-    return_fold_predictions: bool = False
+    return_fold_indices: bool = True,
+    return_fold_predictions: bool = True
 ) -> Dict[str, Any]:
 
     seed = config["project"]["seed"]
@@ -163,11 +163,11 @@ def run_cv(
         random_state=seed
     )
 
-    oof_preds = np.zeros(len(X))
+    oof_preds = np.zeros(len(X), dtype=np.float32)
+
     fold_scores = []
     models = []
     feature_importance = []
-
     fold_indices = []
     fold_predictions = []
 
@@ -182,12 +182,11 @@ def run_cv(
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
         y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
 
-        if return_fold_indices:
-            fold_indices.append({
-                "fold": fold,
-                "train_idx": train_idx.tolist(),
-                "valid_idx": valid_idx.tolist()
-            })
+        fold_indices.append({
+            "fold": fold,
+            "train_idx": train_idx.tolist(),
+            "valid_idx": valid_idx.tolist()
+        })
 
         model = get_model(model_name, model_params)
 
@@ -204,12 +203,11 @@ def run_cv(
         preds = predict_proba_safe(model, model_name, X_valid)
         oof_preds[valid_idx] = preds
 
-        if return_fold_predictions:
-            fold_predictions.append({
-                "fold": fold,
-                "valid_idx": valid_idx.tolist(),
-                "preds": preds.tolist()
-            })
+        fold_predictions.append({
+            "fold": fold,
+            "valid_idx": valid_idx.tolist(),
+            "preds": preds.tolist()
+        })
 
         metrics = compute_metrics(y_valid, preds)
         fold_scores.append(metrics)
@@ -249,7 +247,7 @@ def run_cv(
     print(f"Mean AUC:     {mean_auc:.5f}")
     print(f"Final Score:  {final_score:.5f}")
 
-    results = {
+    return {
         "oof_preds": oof_preds,
         "models": models,
         "fold_scores": fold_scores,
@@ -257,36 +255,30 @@ def run_cv(
         "mean_auc": mean_auc,
         "final_score": final_score,
         "feature_importance": feature_importance_df,
-        "model_name": model_name
+        "fold_indices": fold_indices,
+        "fold_predictions": fold_predictions,
+        "model_name": model_name,
+        "model_params": model_params
     }
-
-    if return_fold_indices:
-        results["fold_indices"] = fold_indices
-
-    if return_fold_predictions:
-        results["fold_predictions"] = fold_predictions
-
-    return results
 
 
 # =========================================================
 # SAVE ARTIFACTS
 # =========================================================
 
-def save_cv_outputs(
-    results: Dict[str, Any],
-    config: Dict[str, Any],
-    output_dir: str
-):
+def save_cv_outputs(results: Dict[str, Any], config: Dict[str, Any], output_dir: str):
 
     os.makedirs(output_dir, exist_ok=True)
 
     model_name = results["model_name"]
 
     # OOF
-    np.save(os.path.join(output_dir, f"oof_preds_{model_name}.npy"), results["oof_preds"])
+    np.save(
+        os.path.join(output_dir, f"oof_preds_{model_name}.npy"),
+        results["oof_preds"]
+    )
 
-    # Fold metrics
+    # Metrics
     with open(os.path.join(output_dir, f"fold_scores_{model_name}.json"), "w") as f:
         json.dump(results["fold_scores"], f, indent=4)
 
@@ -297,14 +289,12 @@ def save_cv_outputs(
     )
 
     # Fold indices
-    if "fold_indices" in results:
-        with open(os.path.join(output_dir, f"fold_indices_{model_name}.json"), "w") as f:
-            json.dump(results["fold_indices"], f)
+    with open(os.path.join(output_dir, f"fold_indices_{model_name}.json"), "w") as f:
+        json.dump(results["fold_indices"], f)
 
     # Fold predictions
-    if "fold_predictions" in results:
-        with open(os.path.join(output_dir, f"fold_predictions_{model_name}.json"), "w") as f:
-            json.dump(results["fold_predictions"], f)
+    with open(os.path.join(output_dir, f"fold_predictions_{model_name}.json"), "w") as f:
+        json.dump(results["fold_predictions"], f)
 
     # Models
     if config.get("artifacts", {}).get("save_models", True):
@@ -314,6 +304,9 @@ def save_cv_outputs(
         os.makedirs(model_dir, exist_ok=True)
 
         for i, model in enumerate(results["models"]):
-            joblib.dump(model, os.path.join(model_dir, f"{model_name}_fold_{i}.pkl"))
+            joblib.dump(
+                model,
+                os.path.join(model_dir, f"{model_name}_fold_{i}.pkl")
+            )
 
     print(f"\n💾 Outputs saved to: {output_dir}")
