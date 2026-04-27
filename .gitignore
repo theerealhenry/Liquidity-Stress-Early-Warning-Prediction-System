@@ -47,3 +47,5 @@ outputs/
 *.npy
 *.pkl
 *.txt
+*.json
+logs/
