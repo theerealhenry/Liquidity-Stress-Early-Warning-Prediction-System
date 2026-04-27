@@ -1,14 +1,13 @@
 """
-Baseline Training Pipeline (Elite Production-Grade)
+Baseline Training Pipeline (Experiment-Driven)
 ============================================================
 
-Enhancements:
-- Full reproducibility (run_id, metadata, config snapshot)
-- Calibration-ready outputs (OOF + y_true + fold indices)
-- Fold-wise predictions storage
-- Feature schema tracking
-- Robust artifact structure
-- Future-ready for ensemble + multi-model
+Features:
+- Structured experiment tracking
+- Model-aware output routing
+- Full reproducibility (OOF, y_true, folds, metadata)
+- Calibration-ready outputs
+- Multi-model compatible
 
 Run:
 python -m src.training.train_baseline --config configs/baseline.yaml
@@ -55,11 +54,27 @@ def save_json(obj, path):
         json.dump(obj, f, indent=4)
 
 
-def create_run_dir(base_dir: str):
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(base_dir, f"run_{run_id}")
+def build_run_dir(config: dict):
+    """
+    Builds structured experiment directory:
+    outputs/experiments/{version}/{model}/run_{timestamp}
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    experiment_root = config["paths"]["experiment_root"]
+    version = config["project"]["version"]
+    model_name = config["model"]["name"]
+
+    run_dir = os.path.join(
+        experiment_root,
+        version,
+        model_name,
+        f"run_{timestamp}"
+    )
+
     os.makedirs(run_dir, exist_ok=True)
-    return run_id, run_dir
+
+    return timestamp, run_dir
 
 
 # =========================================================
@@ -78,10 +93,9 @@ def main(config_path: str):
     set_seed(seed)
 
     # -----------------------------------------------------
-    # CREATE RUN DIRECTORY (EXPERIMENT TRACKING)
+    # BUILD RUN DIRECTORY
     # -----------------------------------------------------
-    base_output_dir = config["training"]["output_dir"]
-    run_id, run_dir = create_run_dir(base_output_dir)
+    run_id, run_dir = build_run_dir(config)
 
     print(f"\n🧪 RUN ID: {run_id}")
     print(f"📁 Output Dir: {run_dir}")
@@ -108,12 +122,11 @@ def main(config_path: str):
     print(f"Features shape: {X.shape}")
     print(f"Target distribution:\n{y.value_counts(normalize=True)}")
 
-    # Save raw target (critical for calibration)
+    # Save target
     np.save(os.path.join(run_dir, "y_true.npy"), y.values)
 
     # Save feature schema
-    feature_list = X.columns.tolist()
-    save_json(feature_list, os.path.join(run_dir, "feature_list.json"))
+    save_json(X.columns.tolist(), os.path.join(run_dir, "feature_list.json"))
 
     # -----------------------------------------------------
     # PREPROCESSING
@@ -128,7 +141,6 @@ def main(config_path: str):
 
     print(f"Processed shape: {X_processed.shape}")
 
-    # Save preprocessor
     preprocessor.save(os.path.join(run_dir, "preprocessor.pkl"))
 
     # -----------------------------------------------------
@@ -141,7 +153,7 @@ def main(config_path: str):
         y=y,
         config=config,
         return_fold_indices=True,
-        return_fold_predictions=True   # 👈 NEW
+        return_fold_predictions=True
     )
 
     # -----------------------------------------------------
@@ -149,7 +161,11 @@ def main(config_path: str):
     # -----------------------------------------------------
     print("\n💾 SAVING OUTPUTS")
 
-    save_cv_outputs(results, config, output_dir=run_dir)
+    save_cv_outputs(
+        results=results,
+        config=config,
+        output_dir=run_dir
+    )
 
     # Save fold indices
     joblib.dump(
@@ -157,24 +173,25 @@ def main(config_path: str):
         os.path.join(run_dir, "fold_indices.pkl")
     )
 
-    # Save fold predictions (critical for deep error analysis)
+    # Save fold predictions
     joblib.dump(
         results["fold_predictions"],
         os.path.join(run_dir, "fold_predictions.pkl")
     )
 
     # -----------------------------------------------------
-    # METADATA (EXPERIMENT TRACKING)
+    # METADATA
     # -----------------------------------------------------
     metadata = {
         "run_id": run_id,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "seed": seed,
+        "version": config["project"]["version"],
+        "model": config["model"]["name"],
         "n_samples": int(X.shape[0]),
         "n_features_before": int(X.shape[1]),
         "n_features_after": int(X_processed.shape[1]),
         "target_mean": float(y.mean()),
-        "model_type": config["model"]["name"],
         "metrics": {
             "logloss": float(results["mean_logloss"]),
             "auc": float(results["mean_auc"]),
@@ -200,17 +217,12 @@ def main(config_path: str):
 
 
 # =========================================================
-# CLI ENTRY
+# CLI
 # =========================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to config YAML"
-    )
+    parser.add_argument("--config", type=str, required=True)
 
     args = parser.parse_args()
 
