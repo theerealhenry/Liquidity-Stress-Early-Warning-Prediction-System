@@ -1,15 +1,15 @@
 """
-Advanced Cross-Validation Engine (Model-Agnostic)
-================================================
+Advanced Cross-Validation Engine (Model-Agnostic, Production-Grade)
+==================================================================
 
 Capabilities:
 - Stratified K-Fold CV
 - OOF predictions (ensemble-ready)
 - Fold-level + global metrics (LogLoss, ROC-AUC)
 - Supports LightGBM, XGBoost, CatBoost
-- Feature importance aggregation (model-aware)
+- Feature importance aggregation
 - Model persistence
-- Reproducibility artifacts (fold indices, metadata)
+- Reproducibility artifacts (fold indices, fold predictions)
 
 Design Principles:
 - Fully model-agnostic
@@ -24,7 +24,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss, roc_auc_score
 
@@ -47,7 +47,7 @@ def compute_metrics(y_true, y_pred) -> Dict[str, float]:
 
 
 # =========================================================
-# MODEL FACTORY (FULLY EXTENSIBLE)
+# MODEL FACTORY
 # =========================================================
 
 def get_model(model_name: str, params: Dict[str, Any]):
@@ -65,7 +65,7 @@ def get_model(model_name: str, params: Dict[str, Any]):
 
 
 # =========================================================
-# TRAINING WRAPPER (HANDLES API DIFFERENCES)
+# TRAINING WRAPPER
 # =========================================================
 
 def train_model(model, model_name, X_train, y_train, X_valid, y_valid, training_cfg):
@@ -105,15 +105,23 @@ def train_model(model, model_name, X_train, y_train, X_valid, y_valid, training_
 
 
 # =========================================================
-# FEATURE IMPORTANCE EXTRACTION
+# PREDICTION SAFE HANDLER
+# =========================================================
+
+def predict_proba_safe(model, model_name, X):
+    if model_name in ["lightgbm", "xgboost", "catboost"]:
+        return model.predict_proba(X)[:, 1]
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+
+
+# =========================================================
+# FEATURE IMPORTANCE
 # =========================================================
 
 def get_feature_importance(model, model_name, feature_names):
 
-    if model_name == "lightgbm":
-        importance = model.feature_importances_
-
-    elif model_name == "xgboost":
+    if model_name in ["lightgbm", "xgboost"]:
         importance = model.feature_importances_
 
     elif model_name == "catboost":
@@ -136,6 +144,8 @@ def run_cv(
     X: pd.DataFrame,
     y: pd.Series,
     config: Dict[str, Any],
+    return_fold_indices: bool = False,
+    return_fold_predictions: bool = False
 ) -> Dict[str, Any]:
 
     seed = config["project"]["seed"]
@@ -157,7 +167,9 @@ def run_cv(
     fold_scores = []
     models = []
     feature_importance = []
+
     fold_indices = []
+    fold_predictions = []
 
     print("=" * 60)
     print(f"🚀 STARTING CV | MODEL: {model_name.upper()}")
@@ -170,12 +182,12 @@ def run_cv(
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
         y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
 
-        # Store fold indices (for reproducibility)
-        fold_indices.append({
-            "fold": fold,
-            "train_idx": train_idx.tolist(),
-            "valid_idx": valid_idx.tolist()
-        })
+        if return_fold_indices:
+            fold_indices.append({
+                "fold": fold,
+                "train_idx": train_idx.tolist(),
+                "valid_idx": valid_idx.tolist()
+            })
 
         model = get_model(model_name, model_params)
 
@@ -189,8 +201,15 @@ def run_cv(
             training_cfg
         )
 
-        preds = model.predict_proba(X_valid)[:, 1]
+        preds = predict_proba_safe(model, model_name, X_valid)
         oof_preds[valid_idx] = preds
+
+        if return_fold_predictions:
+            fold_predictions.append({
+                "fold": fold,
+                "valid_idx": valid_idx.tolist(),
+                "preds": preds.tolist()
+            })
 
         metrics = compute_metrics(y_valid, preds)
         fold_scores.append(metrics)
@@ -199,7 +218,6 @@ def run_cv(
 
         models.append(model)
 
-        # Feature importance
         fi = get_feature_importance(model, model_name, X.columns)
         fi["fold"] = fold
         feature_importance.append(fi)
@@ -231,7 +249,7 @@ def run_cv(
     print(f"Mean AUC:     {mean_auc:.5f}")
     print(f"Final Score:  {final_score:.5f}")
 
-    return {
+    results = {
         "oof_preds": oof_preds,
         "models": models,
         "fold_scores": fold_scores,
@@ -239,13 +257,20 @@ def run_cv(
         "mean_auc": mean_auc,
         "final_score": final_score,
         "feature_importance": feature_importance_df,
-        "fold_indices": fold_indices,
         "model_name": model_name
     }
 
+    if return_fold_indices:
+        results["fold_indices"] = fold_indices
+
+    if return_fold_predictions:
+        results["fold_predictions"] = fold_predictions
+
+    return results
+
 
 # =========================================================
-# SAVE ARTIFACTS (ENHANCED)
+# SAVE ARTIFACTS
 # =========================================================
 
 def save_cv_outputs(results: Dict[str, Any], config: Dict[str, Any]):
@@ -255,34 +280,30 @@ def save_cv_outputs(results: Dict[str, Any], config: Dict[str, Any]):
 
     model_name = results["model_name"]
 
-    # -----------------------------------------------------
     # OOF
-    # -----------------------------------------------------
     np.save(os.path.join(output_dir, f"oof_preds_{model_name}.npy"), results["oof_preds"])
 
-    # -----------------------------------------------------
-    # FOLD METRICS
-    # -----------------------------------------------------
+    # Fold metrics
     with open(os.path.join(output_dir, f"fold_scores_{model_name}.json"), "w") as f:
         json.dump(results["fold_scores"], f, indent=4)
 
-    # -----------------------------------------------------
-    # FEATURE IMPORTANCE
-    # -----------------------------------------------------
+    # Feature importance
     results["feature_importance"].to_csv(
         os.path.join(output_dir, f"feature_importance_{model_name}.csv"),
         index=False
     )
 
-    # -----------------------------------------------------
-    # FOLD INDICES (REPRODUCIBILITY)
-    # -----------------------------------------------------
-    with open(os.path.join(output_dir, f"fold_indices_{model_name}.json"), "w") as f:
-        json.dump(results["fold_indices"], f)
+    # Fold indices
+    if "fold_indices" in results:
+        with open(os.path.join(output_dir, f"fold_indices_{model_name}.json"), "w") as f:
+            json.dump(results["fold_indices"], f)
 
-    # -----------------------------------------------------
-    # MODELS
-    # -----------------------------------------------------
+    # Fold predictions
+    if "fold_predictions" in results:
+        with open(os.path.join(output_dir, f"fold_predictions_{model_name}.json"), "w") as f:
+            json.dump(results["fold_predictions"], f)
+
+    # Models
     if config["training"]["save_model"]:
         import joblib
 
