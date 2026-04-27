@@ -8,10 +8,9 @@ project:
   seed: 42
   n_jobs: -1
 
-  # Experiment tracking
   experiment:
     enabled: true
-    name: baseline_lgbm
+    name: lightgbm
     track_run_id: true
 
 
@@ -25,7 +24,6 @@ data:
 
   target: liquidity_stress_next_30d
   id_column: ID
-
   time_column: null
 
 
@@ -42,7 +40,7 @@ features:
 
   selection:
     enabled: false
-    method: null   # "importance", "correlation", "shap"
+    method: null
     top_k: null
 
 
@@ -57,7 +55,6 @@ preprocessing:
   remove_constant: true
   optimize_memory: true
 
-  # Future-proof
   align_test_columns: true
 
 
@@ -70,21 +67,19 @@ cv:
   shuffle: true
   stratified: true
 
-  # Advanced options
   group_column: null
   time_series: false
 
-  # Artifact tracking
   return_fold_indices: true
   return_fold_predictions: true
 
 
 # =========================================================
-# MODEL CONFIGURATION (MODEL-AGNOSTIC)
+# MODEL CONFIGURATION
 # =========================================================
 
 model:
-  name: lightgbm   # switch: xgboost / catboost
+  name: lightgbm   # switch to xgboost / catboost easily
 
   params:
     objective: binary
@@ -125,17 +120,9 @@ training:
   early_stopping_rounds: 100
   verbose_eval: 100
 
-  # Output structure (BASE DIR — run folders created inside)
-  output_dir: outputs/baseline/
+  # IMPORTANT: aligns with final structure
+  output_dir: outputs/experiments/baseline/lightgbm/
 
-  # Artifact control
-  save_models: true
-  save_oof: true
-  save_feature_importance: true
-  save_fold_predictions: true
-  save_fold_indices: true
-
-  # Reproducibility
   deterministic: true
 
 
@@ -160,11 +147,11 @@ evaluation:
 
 
 # =========================================================
-# CALIBRATION CONFIGURATION
+# CALIBRATION CONFIGURATION (NEXT PHASE)
 # =========================================================
 
 calibration:
-  enabled: false   # enabled in calibration phase
+  enabled: false
 
   methods:
     - isotonic
@@ -172,24 +159,25 @@ calibration:
     - temperature
 
   default_method: isotonic
-
   cv_folds: 5
 
 
 # =========================================================
-# ARTIFACT MANAGEMENT
+# ARTIFACT MANAGEMENT (SINGLE SOURCE OF TRUTH)
 # =========================================================
 
 artifacts:
-  save_predictions: true
-  save_oof_predictions: true
   save_models: true
-  save_config_copy: true
+  save_oof_predictions: true
+  save_fold_predictions: true
+  save_fold_indices: true
 
-  # aligned with upgraded pipeline
-  save_metadata: true
+  save_feature_importance: true
   save_feature_list: true
   save_preprocessor: true
+
+  save_metadata: true
+  save_config_copy: true
 
 
 # =========================================================
