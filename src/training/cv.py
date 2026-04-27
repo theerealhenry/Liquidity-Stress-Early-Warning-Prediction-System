@@ -307,7 +307,7 @@ def save_cv_outputs(
             json.dump(results["fold_predictions"], f)
 
     # Models
-    if config["artifacts"]["save_models"]:
+    if config.get("artifacts", {}).get("save_models", True):
         import joblib
 
         model_dir = os.path.join(output_dir, "models", model_name)
