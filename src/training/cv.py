@@ -1,5 +1,5 @@
 """
-Advanced Cross-Validation Engine (Model-Agnostic, Production-Grade)
+Advanced Cross-Validation Engine (Model-Agnosti)
 ==================================================================
 
 Capabilities:
@@ -307,7 +307,7 @@ def save_cv_outputs(
             json.dump(results["fold_predictions"], f)
 
     # Models
-    if config["training"]["save_model"]:
+    if config["artifacts"]["save_models"]:
         import joblib
 
         model_dir = os.path.join(output_dir, "models", model_name)
