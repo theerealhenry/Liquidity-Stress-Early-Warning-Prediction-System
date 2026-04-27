@@ -4,9 +4,15 @@
 
 project:
   name: liquidity_stress_early_warning
-  version: v1_baseline
+  version: v2_baseline_production
   seed: 42
   n_jobs: -1
+
+  # Experiment tracking
+  experiment:
+    enabled: true
+    name: baseline_lgbm
+    track_run_id: true
 
 
 # =========================================================
@@ -20,7 +26,6 @@ data:
   target: liquidity_stress_next_30d
   id_column: ID
 
-  # Optional (future use)
   time_column: null
 
 
@@ -35,10 +40,9 @@ features:
 
   use_all_features: true
 
-  # Optional future feature selection
   selection:
     enabled: false
-    method: null   # options: "importance", "correlation", "shap"
+    method: null   # "importance", "correlation", "shap"
     top_k: null
 
 
@@ -53,6 +57,9 @@ preprocessing:
   remove_constant: true
   optimize_memory: true
 
+  # Future-proof
+  align_test_columns: true
+
 
 # =========================================================
 # CROSS VALIDATION CONFIGURATION
@@ -63,17 +70,21 @@ cv:
   shuffle: true
   stratified: true
 
-  # Optional advanced CV (future)
+  # Advanced options
   group_column: null
   time_series: false
 
+  # Artifact tracking
+  return_fold_indices: true
+  return_fold_predictions: true
+
 
 # =========================================================
-# MODEL CONFIGURATION (LIGHTGBM BASELINE)
+# MODEL CONFIGURATION (MODEL-AGNOSTIC)
 # =========================================================
 
 model:
-  name: lightgbm
+  name: lightgbm   # switch: xgboost / catboost
 
   params:
     objective: binary
@@ -92,7 +103,6 @@ model:
 
     subsample: 0.8
     subsample_freq: 1
-
     colsample_bytree: 0.8
 
     reg_alpha: 0.5
@@ -100,7 +110,7 @@ model:
 
     max_bin: 255
 
-    scale_pos_weight: 5.5   # approx (neg/pos ≈ 27200 / 4800)
+    scale_pos_weight: 5.5
 
     verbosity: -1
     random_state: 42
@@ -115,11 +125,18 @@ training:
   early_stopping_rounds: 100
   verbose_eval: 100
 
-  save_model: true
+  # Output structure (BASE DIR — run folders created inside)
+  output_dir: outputs/baseline/
+
+  # Artifact control
+  save_models: true
   save_oof: true
   save_feature_importance: true
+  save_fold_predictions: true
+  save_fold_indices: true
 
-  output_dir: outputs/baseline/
+  # Reproducibility
+  deterministic: true
 
 
 # =========================================================
@@ -139,11 +156,28 @@ evaluation:
       direction: maximize
 
   threshold_optimization:
-    enabled: false   # future (for classification threshold tuning)
+    enabled: false
 
 
 # =========================================================
-# OUTPUT / ARTIFACTS
+# CALIBRATION CONFIGURATION
+# =========================================================
+
+calibration:
+  enabled: false   # enabled in calibration phase
+
+  methods:
+    - isotonic
+    - sigmoid
+    - temperature
+
+  default_method: isotonic
+
+  cv_folds: 5
+
+
+# =========================================================
+# ARTIFACT MANAGEMENT
 # =========================================================
 
 artifacts:
@@ -152,9 +186,14 @@ artifacts:
   save_models: true
   save_config_copy: true
 
+  # aligned with upgraded pipeline
+  save_metadata: true
+  save_feature_list: true
+  save_preprocessor: true
+
 
 # =========================================================
-# LOGGING
+# LOGGING CONFIGURATION
 # =========================================================
 
 logging:
@@ -165,3 +204,4 @@ logging:
   track_feature_count: true
   track_memory: true
   track_cv_scores: true
+  track_run_time: true
