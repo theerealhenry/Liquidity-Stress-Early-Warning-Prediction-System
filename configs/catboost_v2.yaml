@@ -1,0 +1,143 @@
+# =============================================================================
+# CatBoost v2 — Baseline Multi-Model Configuration
+# Project : Liquidity Stress Early Warning
+# Stage   : baseline
+# Author  : Henry Otsyula
+#
+# CatBoost-specific notes:
+# - Handles categoricals natively: gender, region, segment,
+#   earning_pattern, smartphone passed as cat_features in training wrapper
+# - scale_pos_weight not available in CatBoost; use class_weights instead
+# - auto_class_weights: Balanced is equivalent to sklearn class_weight
+# =============================================================================
+
+project:
+  name: liquidity_stress_early_warning
+  seed: 42
+  n_jobs: -1
+
+experiment:
+  stage: baseline
+  version: v2_baseline
+  track_run_id: true
+
+# -----------------------------------------------------------------------------
+# DATA
+# -----------------------------------------------------------------------------
+data:
+  train_path: data/raw/Train.csv
+  test_path:  data/raw/Test.csv
+  target:     liquidity_stress_next_30d
+  id_column:  ID
+
+# -----------------------------------------------------------------------------
+# FEATURES
+# -----------------------------------------------------------------------------
+features:
+  drop_columns:
+    - ID
+    - liquidity_stress_next_30d
+  use_all_features: true
+  selection:
+    enabled: false
+
+  # CatBoost-specific: columns to treat as categoricals (not OHE needed)
+  cat_features:
+    - gender
+    - region
+    - segment
+    - earning_pattern
+    - smartphone
+
+# -----------------------------------------------------------------------------
+# PREPROCESSING
+# -----------------------------------------------------------------------------
+preprocessing:
+  clip_quantiles: [0.001, 0.999]
+  fillna_value: 0
+  enforce_numeric: false       # CatBoost handles mixed types natively
+  remove_constant: true
+  optimize_memory: true
+  align_test_columns: true
+
+# -----------------------------------------------------------------------------
+# CROSS-VALIDATION
+# -----------------------------------------------------------------------------
+cv:
+  n_splits: 5
+  shuffle: true
+  stratified: true
+  group_column: null
+  time_series: false
+  return_fold_indices: true
+  return_fold_predictions: true
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  name: catboost
+
+  params:
+    loss_function: Logloss
+    eval_metric: AUC
+    iterations: 1500
+    learning_rate: 0.03
+    depth: 6
+    l2_leaf_reg: 3.0
+    bagging_temperature: 0.8
+    random_strength: 1.0
+    border_count: 128            # equivalent to max_bin
+    auto_class_weights: Balanced  # handles ~26% positive class imbalance
+    task_type: CPU
+    random_seed: 42
+    thread_count: -1
+    verbose: 0
+
+# -----------------------------------------------------------------------------
+# TRAINING
+# -----------------------------------------------------------------------------
+training:
+  early_stopping_rounds: 100
+  verbose_eval: 100
+  deterministic: true
+
+# -----------------------------------------------------------------------------
+# EVALUATION
+# -----------------------------------------------------------------------------
+evaluation:
+  primary_metric: logloss
+  metrics:
+    logloss:
+      weight: 0.6
+      direction: minimize
+    roc_auc:
+      weight: 0.4
+      direction: maximize
+  threshold_optimization:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# ARTIFACTS
+# -----------------------------------------------------------------------------
+artifacts:
+  save_models: true
+  save_oof_predictions: true
+  save_fold_predictions: true
+  save_fold_indices: true
+  save_feature_importance: true
+  save_feature_list: true
+  save_preprocessor: true
+  save_metadata: true
+  save_config_copy: true
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  level: INFO
+  log_to_file: true
+  track_feature_count: true
+  track_memory: true
+  track_cv_scores: true
+  track_run_time: true
