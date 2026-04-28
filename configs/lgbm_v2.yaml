@@ -1,0 +1,136 @@
+# =============================================================================
+# LightGBM v2 — Baseline Multi-Model Configuration
+# Project : Liquidity Stress Early Warning
+# Stage   : baseline
+# Author  : Henry Otsyula
+# =============================================================================
+
+project:
+  name: liquidity_stress_early_warning
+  seed: 42
+  n_jobs: -1
+
+experiment:
+  stage: baseline          # maps to outputs/experiments/baseline/
+  version: v2_baseline
+  track_run_id: true
+
+# -----------------------------------------------------------------------------
+# DATA
+# -----------------------------------------------------------------------------
+data:
+  train_path: data/raw/Train.csv
+  test_path:  data/raw/Test.csv
+  target:     liquidity_stress_next_30d
+  id_column:  ID
+
+# -----------------------------------------------------------------------------
+# FEATURES
+# -----------------------------------------------------------------------------
+features:
+  drop_columns:
+    - ID
+    - liquidity_stress_next_30d
+  use_all_features: true
+  selection:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# PREPROCESSING
+# -----------------------------------------------------------------------------
+preprocessing:
+  clip_quantiles: [0.001, 0.999]
+  fillna_value: 0
+  enforce_numeric: true
+  remove_constant: true
+  optimize_memory: true
+  align_test_columns: true
+
+# -----------------------------------------------------------------------------
+# CROSS-VALIDATION
+# -----------------------------------------------------------------------------
+cv:
+  n_splits: 5
+  shuffle: true
+  stratified: true
+  group_column: null
+  time_series: false
+  return_fold_indices: true
+  return_fold_predictions: true
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  name: lightgbm
+
+  params:
+    objective: binary
+    metric:
+      - binary_logloss
+      - auc
+    boosting_type: gbdt
+    learning_rate: 0.03
+    n_estimators: 1500
+    num_leaves: 64
+    max_depth: -1
+    min_child_samples: 50
+    min_child_weight: 0.001
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_alpha: 0.5
+    reg_lambda: 1.0
+    max_bin: 255
+    scale_pos_weight: 5.5
+    verbosity: -1
+    random_state: 42
+    n_jobs: -1
+
+# -----------------------------------------------------------------------------
+# TRAINING
+# -----------------------------------------------------------------------------
+training:
+  early_stopping_rounds: 100
+  verbose_eval: 100
+  deterministic: true
+
+# -----------------------------------------------------------------------------
+# EVALUATION
+# -----------------------------------------------------------------------------
+evaluation:
+  primary_metric: logloss
+  metrics:
+    logloss:
+      weight: 0.6
+      direction: minimize
+    roc_auc:
+      weight: 0.4
+      direction: maximize
+  threshold_optimization:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# ARTIFACTS
+# -----------------------------------------------------------------------------
+artifacts:
+  save_models: true
+  save_oof_predictions: true
+  save_fold_predictions: true
+  save_fold_indices: true
+  save_feature_importance: true
+  save_feature_list: true
+  save_preprocessor: true
+  save_metadata: true
+  save_config_copy: true
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  level: INFO
+  log_to_file: true
+  track_feature_count: true
+  track_memory: true
+  track_cv_scores: true
+  track_run_time: true
