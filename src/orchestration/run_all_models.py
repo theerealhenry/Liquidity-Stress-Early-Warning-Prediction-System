@@ -225,7 +225,7 @@ def _run_training_inprocess(
 
     logger.info("  Fitting preprocessor ...")
     preproc = PreprocessingPipeline(cfg)
-    X_processed = preproc.fit_transform(X, y)
+    X_processed = preproc.fit_transform(X)
 
     logger.info(
         "  Feature matrix: %d rows x %d cols", X_processed.shape[0], X_processed.shape[1]
