@@ -221,7 +221,7 @@ def _run_training_inprocess(
 
     logger.info("  Building features ...")
     train_fe = build_features(train_df)
-    X, y = split_features_target(train_fe, target_col=cfg["data"]["target"])
+    X, y = split_features_target(train_fe)
 
     logger.info("  Fitting preprocessor ...")
     preproc = PreprocessingPipeline(cfg)
