@@ -13,6 +13,11 @@ project:
     name: lightgbm
     track_run_id: true
 
+paths:
+  experiment_root: outputs/experiments/
+
+training:
+  output_dir: baseline/lightgbm/
 
 # =========================================================
 # DATA CONFIGURATION
@@ -120,8 +125,8 @@ training:
   early_stopping_rounds: 100
   verbose_eval: 100
 
-  # IMPORTANT: aligns with final structure
-  output_dir: outputs/experiments/baseline/lightgbm/
+  # aligns with final structure
+  output_dir: baseline/lightgbm/
 
   deterministic: true
 
