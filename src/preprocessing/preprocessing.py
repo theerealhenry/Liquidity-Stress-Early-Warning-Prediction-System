@@ -74,19 +74,27 @@ def optimize_memory_usage(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     for col in df.columns:
-        col_dtype = df[col].dtype
+        series = df[col]
+        dtype  = series.dtype
+
+        # Skip category columns — already handled upstream
+        if isinstance(dtype, pd.CategoricalDtype):
+            continue
 
         # Convert pandas extension types (Int8, Float64, boolean) to numpy
-        if hasattr(col_dtype, "numpy_dtype"):
-            df[col] = df[col].astype(col_dtype.numpy_dtype)
+        if hasattr(dtype, "numpy_dtype"):
+            series = series.astype(dtype.numpy_dtype)
 
         # Downcast float64 → float32
-        if df[col].dtype == np.float64:
-            df[col] = df[col].astype(np.float32)
+        if series.dtype == np.float64:
+            df[col] = series.astype(np.float32)
 
         # Downcast int64 → smallest signed int
-        elif df[col].dtype == np.int64:
-            df[col] = pd.to_numeric(df[col], downcast="integer")
+        elif series.dtype == np.int64:
+            df[col] = pd.to_numeric(series, downcast="integer")
+
+        else:
+            df[col] = series
 
     return df
 
@@ -326,12 +334,21 @@ class PreprocessingPipeline:
     def _to_numeric(df: pd.DataFrame) -> pd.DataFrame:
         result = {}
         for col in df.columns:
-            s = df[col]
-            # Convert pandas extension types (Int8, Float64, boolean) first
-            if hasattr(s.dtype, "numpy_dtype"):
-                s = s.astype(s.dtype.numpy_dtype)
-            # Then coerce any remaining non-numeric to NaN
+            s    = df[col]
+            dtype = s.dtype
+
+            # ── Category dtype: convert codes to float, NaN for unknowns ──
+            if isinstance(dtype, pd.CategoricalDtype):
+                result[col] = s.cat.codes.replace(-1, np.nan).astype(np.float32)
+                continue
+
+            # ── Pandas extension types (Int8, Float64, boolean) ───────────
+            if hasattr(dtype, "numpy_dtype"):
+                s = s.astype(dtype.numpy_dtype)
+
+            # ── Coerce everything else to numeric ─────────────────────────
             result[col] = pd.to_numeric(s, errors="coerce")
+
         return pd.DataFrame(result, index=df.index)
 
     # =========================================================================
