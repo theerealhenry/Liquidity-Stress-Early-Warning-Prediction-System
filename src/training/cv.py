@@ -77,15 +77,17 @@ def compute_composite_score(
 # MODEL FACTORY
 # =============================================================================
 
-def get_model(model_name: str, params: Dict[str, Any]) -> Any:
+def get_model(model_name: str, params: Dict[str, Any], training_cfg: Dict[str, Any] = None) -> Any:
     if model_name == "lightgbm":
         import lightgbm as lgb
         return lgb.LGBMClassifier(**params)
 
+    # AFTER
     elif model_name == "xgboost":
         import xgboost as xgb
-        # Remove keys that newer XGBoost versions reject
         clean = {k: v for k, v in params.items() if k != "use_label_encoder"}
+        # early_stopping_rounds belongs in constructor from XGBoost >= 1.7
+        clean["early_stopping_rounds"] = training_cfg["early_stopping_rounds"]
         return xgb.XGBClassifier(**clean)
 
     elif model_name == "catboost":
@@ -135,7 +137,6 @@ def train_model(
             X_train, y_train,
             eval_set=[(X_valid, y_valid)],
             verbose=verbose_n,
-            early_stopping_rounds=es_rounds,
         )
 
     elif model_name == "catboost":
@@ -231,7 +232,7 @@ def run_cv(
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
         y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
 
-        model = get_model(model_name, model_params)
+        model = get_model(model_name, model_params, training_cfg)
         model = train_model(
             model, model_name,
             X_train, y_train, X_valid, y_valid,
