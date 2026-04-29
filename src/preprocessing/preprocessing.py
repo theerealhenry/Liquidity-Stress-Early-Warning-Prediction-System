@@ -335,6 +335,9 @@ class PreprocessingPipeline:
         result = {}
         for col in df.columns:
             s    = df[col]
+             # Duplicate column names cause df[col] to return a DataFrame.
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
             dtype = s.dtype
 
             # ── Category dtype: convert codes to float, NaN for unknowns ──
