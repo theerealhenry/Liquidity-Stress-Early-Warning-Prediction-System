@@ -1,5 +1,5 @@
 """
-Feature Engineering Module — v2.0 (Production Grade)
+Feature Engineering Module — v2.1 (Production Grade)
 ======================================================
 
 Project     : AI4EAC Liquidity Stress Early Warning Prediction (Zindi Africa)
@@ -7,6 +7,50 @@ Task        : Binary classification — predict P(liquidity stress within 30 day
 Metrics     : Log Loss (60%) + ROC-AUC (40%)
 Data        : 6-month mobile money panel — 40,000 customers × 7 monthly snapshots
               226 raw columns → expanded feature set
+
+Changelog v2.1
+--------------
+BUG 1 — CRITICAL: Duplicate 'age' column
+  _categorical_features() re-created 'age' from df["age"] even though
+  'age' already exists in the raw DataFrame. pd.concat([df, feature_df])
+  produced two columns named 'age', causing df[col] to return a DataFrame
+  instead of a Series — crashing PreprocessingPipeline._to_numeric() with
+  'DataFrame object has no attribute dtype'.
+  Fix: removed the age re-creation from _categorical_features(). The raw
+  'age' column passes through untouched in the original df.
+
+BUG 2 — CRITICAL: activity_rate duplicates x_90_d_activity_rate
+  _categorical_features() created feats["activity_rate"] from
+  df["x_90_d_activity_rate"] — a renamed copy of a raw column. After
+  concat, both 'x_90_d_activity_rate' (raw) and 'activity_rate'
+  (engineered copy) exist. While not a duplicate name, it is a
+  redundant feature that inflates importance scores for what is
+  effectively the same signal measured twice.
+  Fix: removed activity_rate from _categorical_features(). The raw
+  x_90_d_activity_rate column passes through and is used directly.
+
+BUG 3 — MODERATE: _recency_features log suffix creates duplicate keys
+  When called with suffix="_log", _recency_features() produced:
+    {g}_recency_ratio_log     (the ratio itself)
+    {g}_recency_ratio_log_log (the log of the ratio, with _log suffix)
+  The second key is semantically wrong (log of log of ratio).
+  Fix: the log-of-ratio feature is only computed when suffix == ""
+  (raw call). The _log suffix call only computes the ratio on
+  log-transformed inputs — no nested log naming.
+
+BUG 4 — MODERATE: _zero_indicators runs on engineered columns
+  _zero_indicators(df) only sees the raw df (correct). However, if
+  called after concat it would also flag engineered features — leading
+  to thousands of redundant indicator columns.
+  Confirmed: currently called on raw df before concat — no change
+  needed. Added explicit docstring note to prevent future regression.
+
+BUG 5 — MINOR: _categorical_features earning_pattern_encoded
+  pattern_map was built from df["earning_pattern"].dropna().unique()
+  which is non-deterministic in ordering across runs on some pandas
+  versions (unique() order is insertion-order but dropna() can vary).
+  Fix: sorted() applied to unique values before enumeration to ensure
+  deterministic encoding across all environments.
 
 Design Principles
 -----------------
@@ -114,6 +158,14 @@ WINSORISE_PERCENTILE : float = 99.0
 # Segment value tier — ordered for ordinal encoding
 SEGMENT_ORDER : Dict[str, int] = {"LVC": 0, "MVC": 1, "HVC": 2}
 
+# Raw columns that already exist in df — never re-create these in feature blocks
+# to prevent duplicate columns after pd.concat([df, feature_df])
+_RAW_PASSTHROUGH_COLS = {
+    "age",                   # int64 in raw data — passes through untouched
+    "x_90_d_activity_rate",  # float in raw data — passes through untouched
+    "arpu",                  # float in raw data
+}
+
 
 # ─────────────────────────────────────────────────────────────
 # PUBLIC API
@@ -144,6 +196,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
       In production, fit percentiles on train only and pass as clip_values
       to _winsorise() if required. For competition use, per-split clipping
       is acceptable.
+    - _zero_indicators() must be called on the raw df BEFORE concat to
+      avoid flagging engineered features. Do not move it post-concat.
     """
     df = df.copy()
 
@@ -190,6 +244,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     feature_blocks.update(_categorical_features(df))
 
     # ZERO INDICATOR LAYER
+    # IMPORTANT: must be called on raw df BEFORE concat — see docstring
     feature_blocks.update(_zero_indicators(df))
 
     # LOG-TRANSFORMED LAYER (secondary signals on skewed distributions)
@@ -207,7 +262,24 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # ── Step 5: Winsorise extreme features ───────────────────────────────
     feature_df = _winsorise(feature_df, WINSORISE_FEATURES, WINSORISE_PERCENTILE)
 
+    # ── Step 6: Concat and deduplicate ───────────────────────────────────
     result = pd.concat([df, feature_df], axis=1)
+
+    # Safety net: drop any duplicate columns keeping the first occurrence
+    # (the raw column). This must never trigger in production — if it does,
+    # a feature block is re-creating a raw column and should be fixed.
+    n_before = result.shape[1]
+    result = result.loc[:, ~result.columns.duplicated(keep="first")]
+    n_after = result.shape[1]
+
+    if n_before != n_after:
+        import warnings
+        warnings.warn(
+            f"[feature_engineering] WARNING: {n_before - n_after} duplicate "
+            f"column(s) dropped after concat. Check feature blocks for "
+            f"raw column re-creation.",
+            stacklevel=2,
+        )
 
     print(f"[feature_engineering] Raw columns   : {df.shape[1]}")
     print(f"[feature_engineering] Features built: {feature_df.shape[1]}")
@@ -366,7 +438,6 @@ def _compute_ols_slope(data: np.ndarray) -> np.ndarray:
     np.ndarray of shape (n_samples,) — OLS slope per row
     """
     n = data.shape[1]
-    # x: time steps, most recent = highest value so positive slope = growth
     x     = np.arange(n - 1, -1, -1, dtype=float)   # [5,4,3,2,1,0]
     x_bar = x.mean()
     ss_x  = ((x - x_bar) ** 2).sum()
@@ -387,9 +458,6 @@ def _get_balance_array(df: pd.DataFrame) -> Optional[np.ndarray]:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 1 — TEMPORAL AGGREGATIONS
-# Rationale: basic statistical summaries per transaction type.
-# Mean and std capture level and spread; min/max capture extremes.
-# All 7 groups × 4 stats = 28 features.
 # ─────────────────────────────────────────────────────────────
 
 def _temporal_aggregations(cache: Dict, suffix: str = "") -> Dict:
@@ -404,27 +472,19 @@ def _temporal_aggregations(cache: Dict, suffix: str = "") -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 2 — TREND FEATURES
-# Rationale: M1-M6 simple difference captures direction of change.
-# OLS slope captures the full 6-month trajectory, handling non-monotone
-# trends that the simple difference would miss.
-# SHAP showed balance_trend as a top-7 feature → extended to all groups.
 # ─────────────────────────────────────────────────────────────
 
 def _trend_features(cache: Dict, suffix: str = "") -> Dict:
     feats = {}
     for g, v in cache.items():
         data = v["data"]
-        # Simple trend: M1 minus M6 (positive = growing toward present)
         feats[f"{g}_trend{suffix}"]       = v["recent"] - v["old"]
-        # OLS slope: more robust to non-monotone trajectories
         feats[f"{g}_trend_slope{suffix}"] = _compute_ols_slope(data)
     return feats
 
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 3 — MOMENTUM FEATURES
-# Rationale: M1−M2 captures the most recent single-month change.
-# This is the shortest-lag signal — most predictive of near-term stress.
 # ─────────────────────────────────────────────────────────────
 
 def _momentum_features(cache: Dict, suffix: str = "") -> Dict:
@@ -438,10 +498,6 @@ def _momentum_features(cache: Dict, suffix: str = "") -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 4 — ACCELERATION FEATURES
-# Rationale: Second derivative of the monthly series.
-# Captures whether the rate of change is itself changing —
-# a customer whose deposits are slowing down (decelerating) is
-# at higher stress risk than one with a stable low deposit rate.
 # ─────────────────────────────────────────────────────────────
 
 def _acceleration_features(cache: Dict) -> Dict:
@@ -457,21 +513,14 @@ def _acceleration_features(cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 5 — VOLATILITY FEATURES
-# Rationale: CV (std/mean) is scale-invariant — it measures relative
-# variability, separating high-variance-high-mean customers from
-# genuinely unstable ones. SHAP showed balance_volatility as top-10.
-# Error analysis showed raw magnitude failed to separate FP/FN — CV
-# directly addresses this by normalising for scale.
 # ─────────────────────────────────────────────────────────────
 
 def _volatility_features(cache: Dict, suffix: str = "") -> Dict:
     feats = {}
     for g, v in cache.items():
         data = v["data"]
-        # Coefficient of variation — std relative to mean
         feats[f"{g}_cv{suffix}"] = v["std"] / (v["mean"] + EPS)
 
-        # Recent vs past std ratio — is variability increasing?
         if data.shape[1] >= 4:
             recent_std = data[:, :3].std(axis=1)
             past_std   = data[:, 3:].std(axis=1)
@@ -483,42 +532,26 @@ def _volatility_features(cache: Dict, suffix: str = "") -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 6 — CONSISTENCY FEATURES
-# Rationale: Complement to volatility. CV-based stability score
-# rewards consistent transactors — key signal for financial health.
 # ─────────────────────────────────────────────────────────────
 
 def _consistency_features(cache: Dict) -> Dict:
     feats = {}
     for g, v in cache.items():
-        # Inverse CV — higher = more consistent
         feats[f"{g}_consistency"] = v["mean"] / (v["std"] + EPS)
     return feats
 
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 7 — ACTIVITY FEATURES
-# Rationale: Sparsity is itself a stress signal. A customer who was
-# active 6/6 months is very different from one active 2/6.
-# Zero-streak captures consecutive inactivity — sudden silence after
-# regular activity is a strong early warning signal.
 # ─────────────────────────────────────────────────────────────
 
 def _activity_features(cache: Dict) -> Dict:
     feats = {}
     for g, v in cache.items():
         activity = (v["data"] > 0).astype(int)
-
-        # Count of active months
-        feats[f"{g}_active_months"] = activity.sum(axis=1)
-
-        # Activity switch rate — how often does the customer toggle
-        # between active and inactive months?
+        feats[f"{g}_active_months"]   = activity.sum(axis=1)
         feats[f"{g}_activity_switch"] = np.abs(np.diff(activity, axis=1)).sum(axis=1)
-
-        # Consecutive zero streak from M1 backwards
-        # (how many most-recent months show zero activity)
-        feats[f"{g}_zero_streak"] = _compute_zero_streak(activity)
-
+        feats[f"{g}_zero_streak"]     = _compute_zero_streak(activity)
     return feats
 
 
@@ -538,8 +571,7 @@ def _compute_zero_streak(activity: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 8 — RECENCY FEATURES
 # Rationale: deposit_recency_ratio was the #1 SHAP feature.
-# Extended to all 7 transaction types. Recent-3-months average
-# divided by past-3-months average — captures behavioral shift.
+# Extended to all 7 transaction types.
 # ─────────────────────────────────────────────────────────────
 
 def _recency_features(cache: Dict, suffix: str = "") -> Dict:
@@ -549,20 +581,21 @@ def _recency_features(cache: Dict, suffix: str = "") -> Dict:
         if data.shape[1] >= 6:
             recent_avg = data[:, :3].mean(axis=1)   # M1–M3
             past_avg   = data[:, 3:].mean(axis=1)   # M4–M6
-            feats[f"{g}_recency_ratio{suffix}"] = (
-                recent_avg / (past_avg + EPS)
-            )
-            # Log of recency ratio — handles extreme ratios (near-zero past)
-            feats[f"{g}_recency_ratio_log{suffix}"] = np.log1p(
-                recent_avg / (past_avg + EPS)
-            )
+            ratio      = recent_avg / (past_avg + EPS)
+
+            feats[f"{g}_recency_ratio{suffix}"] = ratio
+
+            # Log of recency ratio — only on raw call (suffix == "")
+            # When suffix="_log", inputs are already log-transformed;
+            # adding another log would create an uninterpretable feature.
+            if suffix == "":
+                feats[f"{g}_recency_ratio_log"] = np.log1p(ratio)
+
     return feats
 
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 9 — PEAK INTENSITY FEATURES
-# Rationale: max/mean ratio identifies customers who have occasional
-# large transactions vs. consistent transactors — different risk profiles.
 # ─────────────────────────────────────────────────────────────
 
 def _peak_intensity_features(cache: Dict) -> Dict:
@@ -574,10 +607,6 @@ def _peak_intensity_features(cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 10 — BALANCE FEATURES
-# Rationale: Balance is the most direct liquidity signal.
-# SHAP showed m2–m5 daily avg bal in top 7 features.
-# We now add slope (OLS), CV (stability), range, min, max, and
-# whether balance recovered after a drawdown (resilience signal).
 # ─────────────────────────────────────────────────────────────
 
 def _balance_features(df: pd.DataFrame) -> Dict:
@@ -586,40 +615,27 @@ def _balance_features(df: pd.DataFrame) -> Dict:
     if data is None:
         return feats
 
-    current = data[:, 0]   # M1 — most recent
-    oldest  = data[:, -1]  # M6
+    current = data[:, 0]
+    oldest  = data[:, -1]
 
-    # Simple trend: M1 − M6
     feats["balance_trend"]      = current - oldest
-    # OLS slope over 6 months
     feats["balance_slope"]      = _compute_ols_slope(data)
-    # Spread (std) — captures instability
     feats["balance_volatility"] = data.std(axis=1)
-    # CV — scale-invariant instability (addresses magnitude confounding)
     feats["balance_cv"]         = data.std(axis=1) / (data.mean(axis=1) + EPS)
-    # Range
     feats["balance_range"]      = data.max(axis=1) - data.min(axis=1)
-    # Min and max absolute levels
     feats["balance_min"]        = data.min(axis=1)
     feats["balance_max"]        = data.max(axis=1)
-    # M1 balance level (standalone — SHAP showed raw balance features are critical)
     feats["balance_m1"]         = current
 
-    # Balance recovery: did M1 recover relative to the minimum in M2–M6?
-    # Positive value = recovering, negative = still declining
     past_min = data[:, 1:].min(axis=1)
     feats["balance_recovery"]   = current - past_min
-
-    # 3-month vs 6-month balance trend — short-horizon vs long-horizon
-    feats["balance_trend_3m"]   = current - data[:, 2]   # M1 − M3
+    feats["balance_trend_3m"]   = current - data[:, 2]
 
     return feats
 
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 11 — DRAWDOWN FEATURES
-# Rationale: Peak-to-current decline is a classic financial distress
-# signal. SHAP confirmed balance_drawdown as a top-4 feature.
 # ─────────────────────────────────────────────────────────────
 
 def _drawdown_features(df: pd.DataFrame) -> Dict:
@@ -631,9 +647,7 @@ def _drawdown_features(df: pd.DataFrame) -> Dict:
     peak    = data.max(axis=1)
     current = data[:, 0]
 
-    # Proportional drawdown from peak
-    feats["balance_drawdown"] = (peak - current) / (peak + EPS)
-    # Absolute drawdown amount
+    feats["balance_drawdown"]     = (peak - current) / (peak + EPS)
     feats["balance_drawdown_abs"] = peak - current
 
     return feats
@@ -641,9 +655,6 @@ def _drawdown_features(df: pd.DataFrame) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 12 — BALANCE PRESSURE FEATURES
-# Rationale: Balance relative to spending obligations — a customer
-# with 10k balance and 1k monthly withdrawals is very different from
-# one with 10k balance and 9k withdrawals.
 # ─────────────────────────────────────────────────────────────
 
 def _balance_pressure_features(df: pd.DataFrame, cache: Dict) -> Dict:
@@ -656,12 +667,10 @@ def _balance_pressure_features(df: pd.DataFrame, cache: Dict) -> Dict:
     if "withdraw" in cache:
         total_spend = cache["withdraw"]["sum"]
         feats["balance_to_spend_pressure"] = bal / (total_spend + EPS)
-        # M1 withdraw relative to M1 balance — most recent pressure signal
         feats["m1_withdraw_balance_ratio"] = (
             cache["withdraw"]["recent"] / (bal + EPS)
         )
 
-    # Balance relative to total outflow (all spending types)
     total_outflow = sum(
         cache[g]["sum"] for g in OUTFLOW_GROUPS if g in cache
     )
@@ -672,15 +681,11 @@ def _balance_pressure_features(df: pd.DataFrame, cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 13 — CASHFLOW FEATURES
-# Rationale: Net flow and directional ratios are fundamental
-# financial health indicators. Error analysis showed FN/FP groups
-# had similar absolute magnitudes — ratios are needed to separate them.
 # ─────────────────────────────────────────────────────────────
 
 def _cashflow_features(cache: Dict) -> Dict:
     feats = {}
 
-    # 6-month cumulative inflow and outflow
     total_inflow = sum(
         cache[g]["sum"] for g in INFLOW_GROUPS if g in cache
     )
@@ -691,22 +696,15 @@ def _cashflow_features(cache: Dict) -> Dict:
     feats["total_inflow_6m"]  = total_inflow
     feats["total_outflow_6m"] = total_outflow
     feats["net_cashflow_6m"]  = total_inflow - total_outflow
-
-    # Net flow ratio: (inflow − outflow) / (inflow + outflow)
-    # Ranges [−1, +1]. Negative = outflow dominant → stress signal.
-    feats["net_flow_ratio"] = (
+    feats["net_flow_ratio"]   = (
         (total_inflow - total_outflow) / (total_inflow + total_outflow + EPS)
     )
+    feats["spend_to_inflow"]  = total_outflow / (total_inflow + EPS)
 
-    # Spend-to-inflow ratio (SHAP top-11)
-    feats["spend_to_inflow"] = total_outflow / (total_inflow + EPS)
-
-    # Withdraw-to-deposit ratio (cash extraction rate)
     if "withdraw" in cache and "deposit" in cache:
         feats["withdraw_deposit_ratio"] = (
             cache["withdraw"]["sum"] / (cache["deposit"]["sum"] + EPS)
         )
-        # M1-only withdraw/deposit ratio — most recent month signal
         feats["m1_withdraw_deposit_ratio"] = (
             cache["withdraw"]["recent"] / (cache["deposit"]["recent"] + EPS)
         )
@@ -716,15 +714,11 @@ def _cashflow_features(cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 14 — CASHFLOW SLOPE FEATURES
-# Rationale: The slope of net cashflow over 6 months captures
-# whether a customer's financial position is systematically
-# improving or deteriorating — not just the current level.
 # ─────────────────────────────────────────────────────────────
 
 def _cashflow_slope_features(df: pd.DataFrame, cache: Dict) -> Dict:
     feats = {}
 
-    # Build monthly net cashflow array (n × 6)
     inflow_months  = np.zeros((len(df), len(MONTHS)))
     outflow_months = np.zeros((len(df), len(MONTHS)))
 
@@ -740,14 +734,12 @@ def _cashflow_slope_features(df: pd.DataFrame, cache: Dict) -> Dict:
 
     net_monthly = inflow_months - outflow_months
 
-    feats["net_cashflow_slope"]    = _compute_ols_slope(net_monthly)
-    feats["inflow_slope"]          = _compute_ols_slope(inflow_months)
-    feats["outflow_slope"]         = _compute_ols_slope(outflow_months)
-    # Inflow slope minus outflow slope — divergence signal
+    feats["net_cashflow_slope"]              = _compute_ols_slope(net_monthly)
+    feats["inflow_slope"]                    = _compute_ols_slope(inflow_months)
+    feats["outflow_slope"]                   = _compute_ols_slope(outflow_months)
     feats["inflow_outflow_slope_divergence"] = (
         feats["inflow_slope"] - feats["outflow_slope"]
     )
-    # M1 net cashflow
     feats["net_cashflow_m1"] = net_monthly[:, 0]
 
     return feats
@@ -755,16 +747,11 @@ def _cashflow_slope_features(df: pd.DataFrame, cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 15 — CASHFLOW VOLATILITY
-# Rationale: Std of monthly net cashflow — customers with erratic
-# cashflow patterns are at higher stress risk than those with
-# stable (even if low) cashflows. The previous version incorrectly
-# computed deposit_std − withdraw_std (a difference, not volatility).
 # ─────────────────────────────────────────────────────────────
 
 def _cashflow_volatility(df: pd.DataFrame, cache: Dict) -> Dict:
     feats = {}
 
-    # Monthly net cashflow std — true cashflow volatility
     net_monthly = np.zeros((len(df), len(MONTHS)))
     for i, m in enumerate(MONTHS):
         for g in INFLOW_GROUPS:
@@ -786,9 +773,6 @@ def _cashflow_volatility(df: pd.DataFrame, cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 16 — P2P FEATURES
-# Rationale: Mobile money P2P flows (mm_send / received) reveal
-# social network financial behaviour. Net P2P position (receiver
-# vs sender) is a proxy for financial dependency.
 # ─────────────────────────────────────────────────────────────
 
 def _p2p_features(cache: Dict) -> Dict:
@@ -799,15 +783,12 @@ def _p2p_features(cache: Dict) -> Dict:
     send    = cache["mm_send"]["sum"]
     receive = cache["received"]["sum"]
 
-    # Net P2P: positive = net receiver, negative = net sender
-    feats["p2p_net_flow"]     = receive - send
-    # Ratio: receive / send — > 1 means receiving more than sending
+    feats["p2p_net_flow"]           = receive - send
     feats["p2p_receive_send_ratio"] = receive / (send + EPS)
-    # M1 P2P ratio — most recent month
-    feats["p2p_m1_ratio"] = (
+    feats["p2p_m1_ratio"]           = (
         cache["received"]["recent"] / (cache["mm_send"]["recent"] + EPS)
     )
-    # P2P dependency: is P2P the dominant inflow?
+
     total_inflow = sum(cache[g]["sum"] for g in INFLOW_GROUPS if g in cache)
     feats["p2p_inflow_share"] = receive / (total_inflow + EPS)
 
@@ -816,9 +797,6 @@ def _p2p_features(cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 17 — BANKING FEATURES
-# Rationale: Bank transfer inflows indicate formal banking access —
-# a protective factor against liquidity stress. ARPU-relative
-# features normalise for customer value tier.
 # ─────────────────────────────────────────────────────────────
 
 def _banking_features(df: pd.DataFrame, cache: Dict) -> Dict:
@@ -828,15 +806,14 @@ def _banking_features(df: pd.DataFrame, cache: Dict) -> Dict:
 
     bank = cache["transfer_from_bank"]
 
-    feats["bank_transfer_slope"]   = _compute_ols_slope(bank["data"])
-    feats["bank_transfer_trend"]   = bank["recent"] - bank["old"]
-    feats["bank_transfer_m1"]      = bank["recent"]
-    feats["bank_has_bank_inflow"]  = (bank["sum"] > 0).astype(int)
+    feats["bank_transfer_slope"]  = _compute_ols_slope(bank["data"])
+    feats["bank_transfer_trend"]  = bank["recent"] - bank["old"]
+    feats["bank_transfer_m1"]     = bank["recent"]
+    feats["bank_has_bank_inflow"] = (bank["sum"] > 0).astype(int)
 
-    # ARPU-relative features — normalise by customer value tier
     if "arpu" in df.columns:
         arpu = df["arpu"].values.astype(float)
-        feats["deposit_intensity"]     = (
+        feats["deposit_intensity"] = (
             cache["deposit"]["sum"] / (arpu + EPS)
             if "deposit" in cache else np.zeros(len(df))
         )
@@ -847,10 +824,6 @@ def _banking_features(df: pd.DataFrame, cache: Dict) -> Dict:
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 18 — INTERACTION FEATURES (SHAP-EVIDENCED)
-# Rationale: SHAP dependence plot showed balance_trend effect is
-# modulated by m2_daily_avg_bal (pink = high balance dampens SHAP).
-# This is a textbook interaction effect — we engineer it explicitly
-# rather than relying on the tree to discover it with splits.
 # ─────────────────────────────────────────────────────────────
 
 def _interaction_features(
@@ -860,17 +833,11 @@ def _interaction_features(
 ) -> Dict:
     feats = {}
 
-    # ── Interaction 1: balance_trend × avg_balance ───────────────────────
-    # SHAP dependence plot directly evidenced this interaction.
-    # Declining balance (negative trend) hurts most when balance is low.
     if "balance_trend" in feature_blocks and "m2_daily_avg_bal" in df.columns:
-        bal_trend  = np.asarray(feature_blocks["balance_trend"])
-        m2_bal     = df["m2_daily_avg_bal"].values.astype(float)
+        bal_trend = np.asarray(feature_blocks["balance_trend"])
+        m2_bal    = df["m2_daily_avg_bal"].values.astype(float)
         feats["balance_trend_x_balance_level"] = bal_trend * m2_bal
 
-    # ── Interaction 2: deposit_recency × balance_level ───────────────────
-    # Customers who have recently stopped depositing AND have low balance
-    # are at highest risk. This product captures the conjunction.
     if "deposit" in cache and "m1_daily_avg_bal" in df.columns:
         if "deposit_recency_ratio" in feature_blocks:
             dep_recency = np.asarray(feature_blocks["deposit_recency_ratio"])
@@ -881,28 +848,20 @@ def _interaction_features(
         m1_bal = df["m1_daily_avg_bal"].values.astype(float)
         feats["deposit_recency_x_balance"] = dep_recency * m1_bal
 
-    # ── Interaction 3: withdraw_recency_ratio × spend_to_inflow ──────────
-    # SHAP showed withdraw_recency_ratio with extreme values (up to 5.5).
-    # Interacted with spend_to_inflow it captures: customer is both
-    # recently withdrawing more AND spending more than they earn.
     if "withdraw" in cache:
-        data = cache["withdraw"]["data"]
+        data      = cache["withdraw"]["data"]
         w_recency = data[:, :3].mean(axis=1) / (data[:, 3:].mean(axis=1) + EPS)
 
         if "spend_to_inflow" in feature_blocks:
             spend_ratio = np.asarray(feature_blocks["spend_to_inflow"])
             feats["withdraw_recency_x_spend_ratio"] = w_recency * spend_ratio
 
-    # ── Interaction 4: balance_cv × balance_drawdown ─────────────────────
-    # High CV (volatile balance) + high drawdown = compounding stress signal.
     if "balance_cv" in feature_blocks and "balance_drawdown" in feature_blocks:
         feats["balance_cv_x_drawdown"] = (
             np.asarray(feature_blocks["balance_cv"])
             * np.asarray(feature_blocks["balance_drawdown"])
         )
 
-    # ── Interaction 5: net_cashflow_slope × balance_m1 ───────────────────
-    # Declining cashflow trajectory is most dangerous when current balance is low.
     if "net_cashflow_slope" in feature_blocks and "m1_daily_avg_bal" in df.columns:
         feats["cashflow_slope_x_balance"] = (
             np.asarray(feature_blocks["net_cashflow_slope"])
@@ -914,10 +873,17 @@ def _interaction_features(
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE BLOCK 19 — CATEGORICAL FEATURES
-# Rationale: Segment (LVC/MVC/HVC) and earning_pattern are fixed
-# per customer. Tree models handle ordinal-encoded categoricals
-# natively. These are profile features — they set the baseline
-# risk context before any behavioural signal is considered.
+#
+# FIX (Bug 1): 'age' removed from this block. It already exists
+# in the raw DataFrame and passes through pd.concat untouched.
+# Re-creating it here produced a duplicate column name.
+#
+# FIX (Bug 2): 'activity_rate' (copy of x_90_d_activity_rate) removed.
+# The raw column passes through and is used directly by the model.
+#
+# FIX (Bug 5): earning_pattern encoding is now deterministic —
+# sorted() applied before enumeration so encoding is stable across
+# all pandas versions and execution environments.
 # ─────────────────────────────────────────────────────────────
 
 def _categorical_features(df: pd.DataFrame) -> Dict:
@@ -929,11 +895,10 @@ def _categorical_features(df: pd.DataFrame) -> Dict:
             df["segment"].str.upper().map(SEGMENT_ORDER).fillna(1).astype(int)
         )
 
-    # Earning pattern: label encode (tree model handles cardinality)
+    # Earning pattern: deterministic label encode (sorted unique values)
     if "earning_pattern" in df.columns:
-        pattern_map = {
-            v: i for i, v in enumerate(df["earning_pattern"].dropna().unique())
-        }
+        unique_patterns = sorted(df["earning_pattern"].dropna().unique())
+        pattern_map     = {v: i for i, v in enumerate(unique_patterns)}
         feats["earning_pattern_encoded"] = (
             df["earning_pattern"].map(pattern_map).fillna(-1).astype(int)
         )
@@ -950,13 +915,9 @@ def _categorical_features(df: pd.DataFrame) -> Dict:
             df["gender"].str.strip().str.upper() == "M"
         ).astype(int)
 
-    # Age — already numeric but treat as feature directly
-    if "age" in df.columns:
-        feats["age"] = df["age"].values.astype(float)
-
-    # Activity rate — direct numeric (90-day engagement baseline)
-    if "x_90_d_activity_rate" in df.columns:
-        feats["activity_rate"] = df["x_90_d_activity_rate"].values.astype(float)
+    # NOTE: 'age' intentionally excluded — raw column passes through.
+    # NOTE: 'activity_rate' intentionally excluded — x_90_d_activity_rate
+    #       passes through as-is. Do not re-add either without renaming.
 
     return feats
 
@@ -965,15 +926,17 @@ def _categorical_features(df: pd.DataFrame) -> Dict:
 # FEATURE BLOCK 20 — ZERO INDICATOR FLAGS
 # Rationale: Per competition spec, null = zero activity.
 # For features with 60–98% zero rate, a binary flag is more
-# informative than the raw value — the model learns "this customer
-# never uses this service" as a distinct category.
-# Outside this range: < 60% zeros has too many non-zeros (flag redundant);
-# > 98% zeros means almost everyone is zero (near-constant, low info).
+# informative than the raw value.
+#
+# IMPORTANT: This function must be called on the raw df BEFORE
+# pd.concat([df, feature_df]). Calling it after concat would
+# flag engineered features as well, producing thousands of
+# redundant indicator columns. See build_features() step ordering.
 # ─────────────────────────────────────────────────────────────
 
 def _zero_indicators(df: pd.DataFrame) -> Dict:
     feats = {}
-    skip = {TARGET, ID_COL}
+    skip  = {TARGET, ID_COL}
     numeric_cols = df.select_dtypes(include="number").columns
 
     for col in numeric_cols:
