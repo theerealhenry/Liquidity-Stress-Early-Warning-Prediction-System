@@ -1,0 +1,93 @@
+artifacts:
+  save_config_copy: true
+  save_feature_importance: true
+  save_feature_list: true
+  save_fold_indices: true
+  save_fold_predictions: true
+  save_metadata: true
+  save_models: true
+  save_oof_predictions: true
+  save_preprocessor: true
+cv:
+  group_column: null
+  n_splits: 5
+  return_fold_indices: true
+  return_fold_predictions: true
+  shuffle: true
+  stratified: true
+  time_series: false
+data:
+  id_column: ID
+  target: liquidity_stress_next_30d
+  test_path: data/raw/Test.csv
+  train_path: data/raw/Train.csv
+evaluation:
+  metrics:
+    logloss:
+      direction: minimize
+      weight: 0.6
+    roc_auc:
+      direction: maximize
+      weight: 0.4
+  primary_metric: logloss
+  threshold_optimization:
+    enabled: false
+experiment:
+  stage: v2_feature_expansion
+  track_run_id: true
+  version: v2_tuned
+features:
+  drop_columns:
+  - ID
+  - liquidity_stress_next_30d
+  selection:
+    enabled: false
+  use_all_features: true
+logging:
+  level: INFO
+  log_to_file: true
+  track_cv_scores: true
+  track_feature_count: true
+  track_memory: true
+  track_run_time: true
+model:
+  name: lightgbm
+  params:
+    boosting_type: gbdt
+    colsample_bytree: 0.585886359451152
+    learning_rate: 0.006581226137618131
+    max_bin: 511
+    max_depth: 9
+    metric:
+    - binary_logloss
+    - auc
+    min_child_samples: 70
+    min_child_weight: 0.07326135751341468
+    n_estimators: 2900
+    n_jobs: -1
+    num_leaves: 200
+    objective: binary
+    random_state: 42
+    reg_alpha: 0.003889584402510527
+    reg_lambda: 0.04270992608635995
+    scale_pos_weight: 5.666666666666667
+    subsample: 0.8844528890241867
+    subsample_freq: 5
+    verbosity: -1
+preprocessing:
+  align_test_columns: true
+  clip_quantiles:
+  - 0.001
+  - 0.999
+  enforce_numeric: true
+  fillna_value: 0
+  optimize_memory: true
+  remove_constant: true
+project:
+  n_jobs: -1
+  name: liquidity_stress_early_warning
+  seed: 42
+training:
+  deterministic: true
+  early_stopping_rounds: 100
+  verbose_eval: 100
