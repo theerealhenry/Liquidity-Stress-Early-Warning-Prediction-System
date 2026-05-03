@@ -1,0 +1,95 @@
+artifacts:
+  save_config_copy: true
+  save_feature_importance: true
+  save_feature_list: true
+  save_fold_indices: true
+  save_fold_predictions: true
+  save_metadata: true
+  save_models: true
+  save_oof_predictions: true
+  save_preprocessor: true
+cv:
+  group_column: null
+  n_splits: 5
+  return_fold_indices: true
+  return_fold_predictions: true
+  shuffle: true
+  stratified: true
+  time_series: false
+data:
+  id_column: ID
+  target: liquidity_stress_next_30d
+  test_path: data/raw/Test.csv
+  train_path: data/raw/Train.csv
+evaluation:
+  metrics:
+    logloss:
+      direction: minimize
+      weight: 0.6
+    roc_auc:
+      direction: maximize
+      weight: 0.4
+  primary_metric: logloss
+  threshold_optimization:
+    enabled: false
+experiment:
+  stage: v2_feature_expansion
+  track_run_id: true
+  version: v2_tuned
+features:
+  drop_columns:
+  - ID
+  - liquidity_stress_next_30d
+  selection:
+    enabled: false
+  use_all_features: true
+logging:
+  level: INFO
+  log_to_file: true
+  track_cv_scores: true
+  track_feature_count: true
+  track_memory: true
+  track_run_time: true
+model:
+  name: xgboost
+  params:
+    booster: gbtree
+    colsample_bylevel: 0.8043398580939569
+    colsample_bytree: 0.5875191235583767
+    eval_metric:
+    - logloss
+    - auc
+    gamma: 2.4379193232340723
+    grow_policy: depthwise
+    learning_rate: 0.005621338062408291
+    max_bin: 512
+    max_depth: 8
+    min_child_weight: 41.96018850535828
+    n_estimators: 2600
+    n_jobs: -1
+    objective: binary:logistic
+    random_state: 42
+    reg_alpha: 0.02790394720684204
+    reg_lambda: 1.8200043779488442
+    scale_pos_weight: 5.666666666666667
+    subsample: 0.9526132253107942
+    tree_method: hist
+    use_label_encoder: false
+    verbosity: 0
+preprocessing:
+  align_test_columns: true
+  clip_quantiles:
+  - 0.001
+  - 0.999
+  enforce_numeric: true
+  fillna_value: 0
+  optimize_memory: true
+  remove_constant: true
+project:
+  n_jobs: -1
+  name: liquidity_stress_early_warning
+  seed: 42
+training:
+  deterministic: true
+  early_stopping_rounds: 100
+  verbose_eval: 100
