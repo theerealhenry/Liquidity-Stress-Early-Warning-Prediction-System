@@ -1076,6 +1076,54 @@ def main() -> None:
 
     calibrate = not args.no_calibrate
 
+    # =========================================================================
+    # DIVERSITY-CHECK FAST PATH
+    # Skips all tuning. Loads completed study artifacts directly from SQLite
+    # storage and runs check_post_tuning_diversity() on the best params found.
+    # Requires: outputs/tuning/{model}_study.db must exist for both models.
+    # =========================================================================
+    if args.diversity_check:
+        print(f"\nDiversity check mode — skipping tuning")
+        print(f"  Loading completed study artifacts from: {TUNING_DIR}")
+
+        if len(models_to_tune) != 2 or set(models_to_tune) != set(TUNABLE_MODELS):
+            print(
+                "  WARNING: Diversity check requires both models "
+                f"({TUNABLE_MODELS}). Switching to --model all."
+            )
+            models_to_tune = TUNABLE_MODELS
+
+        analyses = {}
+        for model_name in models_to_tune:
+            storage_path = TUNING_DIR / f"{model_name}_study.db"
+            if not storage_path.exists():
+                raise FileNotFoundError(
+                    f"No completed study found for '{model_name}' at:\n"
+                    f"  {storage_path}\n"
+                    f"Run tuning first: "
+                    f"python -m src.tuning.tune --model {model_name} --n-trials 100"
+                )
+            print(f"  Loading {model_name} study from {storage_path.name}...")
+            study = create_or_load_study(
+                model_name, storage_path, resume=True
+            )
+            analysis = analyze_study(study, model_name)
+            analyses[model_name] = analysis
+            print(
+                f"  {model_name}: best_score={analysis['best_score']:.5f}  "
+                f"completed={analysis['n_completed']} trials"
+            )
+
+        print("\nRunning post-tuning diversity check...")
+        X, y = load_training_data("configs/lgbm_v2.yaml")
+        check_post_tuning_diversity(
+            analyses["lightgbm"], analyses["xgboost"], X, y
+        )
+        return   
+
+    # =========================================================================
+    # NORMAL TUNING PATH
+    # =========================================================================
     print(f"\nTuning pipeline started")
     print(f"  Models    : {models_to_tune}")
     print(f"  Trials    : {args.n_trials} per model")
@@ -1096,10 +1144,9 @@ def main() -> None:
         )
         analyses[model_name] = analysis
 
-    # ── Post-tuning diversity check ───────────────────────────────────
+    # ── Post-tuning diversity check (optional, after normal tuning) ───
     if args.diversity_check and len(analyses) == 2:
         print("\nRunning post-tuning diversity check...")
-        # Reload data once for diversity check
         X, y = load_training_data("configs/lgbm_v2.yaml")
         check_post_tuning_diversity(
             analyses["lightgbm"], analyses["xgboost"], X, y
@@ -1123,13 +1170,13 @@ def main() -> None:
 
     # ── Save tuning metadata ──────────────────────────────────────────
     metadata = {
-        "created_at"    : datetime.now().isoformat(),
-        "models_tuned"  : models_to_tune,
-        "n_trials"      : args.n_trials,
-        "calibrate"     : calibrate,
-        "seed"          : SEED,
+        "created_at"      : datetime.now().isoformat(),
+        "models_tuned"    : models_to_tune,
+        "n_trials"        : args.n_trials,
+        "calibrate"       : calibrate,
+        "seed"            : SEED,
         "scale_pos_weight": SCALE_POS_WEIGHT,
-        "results"       : {
+        "results"         : {
             m: {
                 "best_score"     : a["best_score"],
                 "baseline_score" : a.get("baseline_score"),
