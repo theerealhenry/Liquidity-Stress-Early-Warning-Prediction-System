@@ -519,12 +519,25 @@ def _validate_no_leakage(df: pd.DataFrame) -> None:
 
 
 def _clean_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Post-processing:
-    1. Replace inf/-inf with NaN then fill 0 (result of division by zero).
-    2. Drop constant columns (zero variance = no information for any model).
-    """
+   
+    # Post-processing:
+    # Replace inf/-inf with NaN then fill 0 (result of division by zero).
+    # Drop constant columns (zero variance = no information for any model).
+
+    # Global ratio explosion guard 
+    # Clips ALL ratio columns at 99th percentile automatically.
+    # Handles division-by-near-zero on sparse columns (60–98% zero rate)
+    # without requiring manual enumeration in WINSORISE_FEATURES.
+
     df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    ratio_cols = [c for c in df.columns if "ratio" in c]
+    for col in ratio_cols:
+        vals = df[col].values
+        upper = np.percentile(vals[np.isfinite(vals)], 99.0)
+        if upper > 0:
+            df[col] = df[col].clip(upper=upper)
+
     non_constant = df.nunique() > 1
     dropped = (~non_constant).sum()
     if dropped > 0:
