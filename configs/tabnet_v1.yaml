@@ -1,0 +1,259 @@
+# =============================================================================
+# TabNet — Base Model Config v1
+# =============================================================================
+# Project : Liquidity Stress Early Warning (AI4EAC / Zindi)
+# Stage   : v3_extended_models
+# Purpose : Introduce an attention-based model with instance-wise feature
+#           selection to complement the linear (LogReg) and tree-based
+#           (GBM) ensemble members.
+#
+# Strategic rationale
+# -------------------
+# After Logistic Regression (Phase 2), we have a linear model with expected
+# OOF correlation ~0.72–0.82 with the GBM cluster.  TabNet adds a third
+# structural class of inductive bias:
+#
+#   GBMs (LGBM / XGB / CatBoost)
+#     Axis-aligned splits on globally selected features.
+#     Same feature used identically for every customer.
+#
+#   Logistic Regression (ElasticNet)
+#     Global linear boundary.  One weight per feature, applied uniformly.
+#
+#   TabNet (pytorch-tabnet)
+#     Sequential attention: for each customer, independently selects
+#     WHICH features to use at each of N_steps decision steps.
+#     Customer A might use balance_slope + inflow_volume_recency_ratio.
+#     Customer B might use withdraw_cv + cashflow_net_slope.
+#     This per-instance routing is structurally impossible in GBMs and LR.
+#
+# Expected OOF correlation with LGBM: 0.82–0.90 (target: < 0.90).
+# Expected individual composite score: 0.20–0.22.
+#
+# With LogReg at ~0.75 and TabNet at ~0.86 correlation with the GBM
+# cluster, the 5-model stacking meta-model gains genuine conditional
+# trust signal — it can down-weight GBMs when LogReg and TabNet agree
+# on a different probability.
+#
+# CRITICAL preprocessing requirement
+# ------------------------------------
+# scale_features: true is MANDATORY for TabNet.
+# Without StandardScaler, attention weights for features with large
+# absolute values (e.g. balance features in KES thousands) dominate
+# the softmax in the attentive transformer, causing all attention mass
+# to collapse onto a tiny feature subset regardless of predictive power.
+# StandardScaler normalises all 825 features to unit variance so the
+# attention mechanism can make meaningful selections.
+#
+# Installation requirement
+# ------------------------
+# pip install pytorch-tabnet torch
+# Verify: python -c "from pytorch_tabnet.tab_model import TabNetClassifier"
+#
+# Serialisation note
+# ------------------
+# TabNet models CANNOT be serialised via joblib.  PyTorch tensors inside
+# the network hold C++ references that do not round-trip through pickle
+# across pytorch versions.  cv.py v2.0 uses pytorch-tabnet's native
+# save_model() / load_model() API for all fold models automatically.
+# Artifact paths use .pkl naming convention but the actual file on disk
+# is a .zip archive written by pytorch-tabnet.
+#
+# Tuning plan
+# -----------
+# After validating baseline OOF correlation, run Optuna with 30–50 trials
+# tuning: n_d/n_a (16/32/64), n_steps (3–7), gamma (1.0–2.0),
+# lambda_sparse (1e-5 to 1e-3, log), learning_rate (1e-3 to 5e-2, log).
+# =============================================================================
+
+project:
+  name    : liquidity-stress-early-warning
+  version : v3_tabnet
+  seed    : 42
+
+experiment:
+  stage   : v3_extended_models
+  version : v3_tabnet
+  # Artifacts will land in:
+  #   outputs/experiments/v3_extended_models/tabnet/run_YYYYMMDD_HHMMSS/
+
+data:
+  train_path : data/raw/Train.csv
+  test_path  : data/raw/Test.csv
+
+preprocessing:
+  clip_quantiles  : [0.001, 0.999]
+  enable_clipping : true
+  # CRITICAL: TabNet attention weights collapse to uniform without
+  # StandardScaler.  Fitted AFTER clipping — outlier values do not
+  # corrupt the learned mean/std used for normalisation.
+  scale_features  : true
+  debug           : true
+
+cv:
+  n_splits : 5
+  shuffle  : true
+  random_state : 42
+  # Stratified K-Fold preserves the 15% positive rate in every fold.
+  # With 5 folds: ~32K training rows, ~8K validation rows per fold.
+  # batch_size=1024 gives ~31 gradient steps per epoch on the training fold.
+
+model:
+  name : tabnet
+  params:
+    # ── Architecture — decision step dimensions ───────────────────────────
+    n_d : 32
+    # Width of the decision step output embedding.  Controls the
+    # representational capacity of each step's prediction contribution.
+    # 32 is appropriate for 825 input features with 40K rows.
+    # 64 would risk overfitting; 16 would underfit the complex interaction
+    # structure revealed in v2.2 feature importance analysis.
+
+    n_a : 32
+    # Width of the attention embedding.  Must equal n_d (paper requirement).
+    # The attention transformer maps n_a dimensions to a feature-selection
+    # mask over all 825 input features at each step.
+
+    n_steps : 5
+    # Number of sequential attention steps.  Each step selects a different
+    # feature subset and contributes to the final prediction.
+    # 5 is the original TabNet paper's recommendation for structured
+    # tabular data.  More steps = more capacity but slower convergence
+    # and higher risk of attention collapse on small datasets.
+
+    # ── Architecture — regularisation ────────────────────────────────────
+    gamma : 1.3
+    # Feature reusage coefficient.  Controls how strongly TabNet discourages
+    # the same feature from being selected in multiple steps.
+    # gamma=1.0: no penalty (feature can be reused freely).
+    # gamma=2.0: strong penalty (each feature used in at most one step).
+    # 1.3 slightly encourages feature diversity across steps, which is
+    # desirable given our 825-feature space contains many correlated
+    # recency/ratio variants.  Higher gamma would over-suppress reuse
+    # of genuinely important features like balance_slope.
+
+    lambda_sparse : 1.0e-4
+    # Sparsity regularisation on attention masks.  Added to the loss:
+    # L_total = CrossEntropy + lambda_sparse * L_sparse
+    # Encourages each attention step to use fewer features (sparse masks).
+    # This is the primary structural regulariser in TabNet — without it,
+    # all attention mass spreads uniformly across all features, defeating
+    # the architecture's purpose.
+    # 1e-4 is the paper default and works well for O(100–1000) features.
+    # If OOF AUC is poor, try 1e-5 (less sparse) or 1e-3 (more sparse).
+
+    # ── Architecture — normalisation ──────────────────────────────────────
+    momentum : 0.02
+    # Ghost batch normalisation momentum.  Very small because our features
+    # are already StandardScaled — the BN layer has minimal work to do.
+    # Higher momentum (e.g. 0.3, the pytorch default) would over-correct
+    # an already-normalised distribution and slow convergence.
+
+    # ── Architecture — GLU layers ─────────────────────────────────────────
+    n_independent : 2
+    # Number of independent (step-specific) GLU layers per decision step.
+    # These capture step-specific patterns not shared across steps.
+
+    n_shared : 2
+    # Number of shared (global) GLU layers whose weights are shared across
+    # all N_steps decision steps.
+    # The equal n_independent=n_shared=2 split follows the paper's
+    # recommendation for a balanced capacity allocation.
+
+    # ── Reproducibility ───────────────────────────────────────────────────
+    seed    : 42
+    verbose : 0
+    # verbose=0 suppresses pytorch-tabnet's per-epoch stdout output.
+    # Fold-level metrics are printed by cv.py's run_cv() loop instead.
+
+training:
+  # ── Stopping criteria ─────────────────────────────────────────────────
+  max_epochs : 200
+  # Upper bound on training epochs.  With patience=20, training typically
+  # stops well before 200.  This is a safety ceiling.
+
+  patience : 20
+  # Early stopping patience in epochs.  Monitored on the validation fold's
+  # LogLoss (eval_metric: logloss in train_model()).
+  # 20 epochs is generous enough to avoid premature stopping during
+  # learning rate warm-up phases, but tight enough to prevent overfitting
+  # on the 8K validation fold.
+
+  # ── Batch configuration ───────────────────────────────────────────────
+  batch_size : 1024
+  # Mini-batch size for stochastic gradient updates.
+  # With ~32K training rows per fold: ~31 gradient steps per epoch.
+  # 1024 provides stable gradient estimates for the BN layers while
+  # remaining fast on CPU (GPU would allow larger batches).
+  # Larger batches (2048+) reduce noise but slow convergence on CPU.
+
+  virtual_batch_size : 256
+  # Ghost batch normalisation splits each batch into sub-batches of this
+  # size for BN statistics.  256 = 4 sub-batches per real batch of 1024.
+  # Must divide batch_size evenly.
+  # Ghost BN is TabNet's key training stability mechanism — it allows
+  # larger effective batch sizes without the BN collapse that occurs
+  # when real batch size >> dataset size in small datasets.
+
+  # ── Class balance ────────────────────────────────────────────────────
+  weights : 1
+  # pytorch-tabnet class balancing mode.
+  # 0 = no weighting (default)
+  # 1 = automatic inverse-frequency weighting
+  # With 15% positive rate, weights=1 applies a 5.6667x weight to the
+  # stress class — identical to class_weight="balanced" in sklearn and
+  # scale_pos_weight=5.6667 in GBM configs.
+
+  # ── These keys are ignored for TabNet but kept for schema consistency ─
+  early_stopping_rounds : null
+  verbose_eval          : null
+
+evaluation:
+  metrics:
+    logloss:
+      weight  : 0.6
+      minimize: true
+    roc_auc:
+      weight  : 0.4
+      minimize: false
+  # Competition formula: 0.6 * LogLoss + 0.4 * (1 - AUC). Lower is better.
+
+artifacts:
+  save_models     : true
+  save_importance : true
+  # Models saved to:
+  #   outputs/experiments/v3_extended_models/tabnet/run_*/models/tabnet/
+  #   tabnet_fold_0.zip ... tabnet_fold_4.zip
+  #   (pytorch-tabnet native format via save_model() — NOT joblib)
+  # Note: cv.py names files with .pkl suffix for directory consistency,
+  # but pytorch-tabnet appends .zip automatically.  _load_tabnet_model()
+  # handles the extension transparently.
+
+paths:
+  experiment_root : outputs/experiments
+  calibration_dir : outputs/calibration/tabnet
+  multi_model_dir : outputs/multi_model
+
+# =============================================================================
+# Post-run checklist
+# =============================================================================
+# After running:
+#   python -m src.orchestration.run_all_models --configs configs/tabnet_v1.yaml
+#
+# Validate in notebook 08 (or quick script):
+#   1. OOF LogLoss  — expected: 0.28–0.38
+#   2. OOF AUC      — expected: 0.87–0.91
+#   3. Composite    — expected: 0.20–0.22
+#   4. Pearson corr(tabnet_oof, lgbm_oof) — TARGET < 0.90
+#      If correlation > 0.92: TabNet is collapsing to GBM-like behaviour.
+#      Try reducing n_steps to 3 or increasing lambda_sparse to 1e-3.
+#   5. Check feature_importance.csv — top features should partially overlap
+#      with GBM top features (balance_slope, inflow_volume_recency_ratio)
+#      but TabNet's step-wise attention should surface different subsets
+#      per step, visible in the attention mask visualisation.
+#   6. If training does not converge (val_loss oscillates or increases
+#      from epoch 1): verify scale_features=true is active and that
+#      StandardScaler was applied before passing data to TabNet.
+#   7. If all fold models show identical predictions: check that seed=42
+#      is propagated and that torch.manual_seed is set by pytorch-tabnet.
+# =============================================================================
