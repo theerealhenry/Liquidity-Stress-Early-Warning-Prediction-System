@@ -1,0 +1,182 @@
+# =============================================================================
+# Logistic Regression — Base Model Config v1
+# =============================================================================
+# Project : Liquidity Stress Early Warning (AI4EAC / Zindi)
+# Stage   : v3_extended_models
+# Purpose : Introduce a structurally diverse base model with a linear
+#           decision boundary to break the 0.978 inter-GBM correlation.
+#
+# Strategic rationale
+# -------------------
+# After full Optuna tuning, LightGBM, XGBoost, and CatBoost correlate at
+# 0.978 on OOF predictions.  All three share the same inductive bias
+# (histogram-based gradient boosting on axis-aligned splits), so stacking
+# them adds no value beyond averaging.
+#
+# Logistic Regression (ElasticNet) provides:
+#   1. A linear decision boundary — structurally orthogonal to tree splits.
+#      Regions where all three GBMs agree but are wrong are exactly the
+#      regions where the linear model's different error surface helps.
+#   2. Expected OOF correlation with LGBM: 0.70–0.82 (target: < 0.82).
+#   3. Well-calibrated probabilities by default — no post-hoc Platt needed
+#      (validate in notebook 07 re-run, but expected to be clean).
+#   4. Explicit feature importance via |coef_[0]| after StandardScaler
+#      normalisation — directly comparable across all 825 features.
+#
+# Individually, LogReg is expected to score ~0.22–0.25 composite (weaker
+# than GBMs at 0.192–0.194).  This is ACCEPTABLE.  Its value is in
+# diversity for the ensemble, not in standalone performance.
+#
+# CRITICAL preprocessing requirement
+# ------------------------------------
+# scale_features: true is MANDATORY for this model.
+# Logistic Regression is not scale-invariant.  Without StandardScaler,
+# a feature with range [0, 1e12] (e.g. pre-clip ratio columns) would
+# dominate the gradient update regardless of actual predictive power.
+# The ElasticNet penalty would also be applied inconsistently across
+# features with different scales, making l1_ratio meaningless.
+#
+# Tuning plan
+# -----------
+# Phase 2 runs this baseline config first.  After validating OOF
+# correlation with GBMs, run 50 Optuna trials tuning:
+#   C         : loguniform(1e-4, 1.0)
+#   l1_ratio  : uniform(0.0, 1.0)
+# 50 trials is sufficient for a 2-parameter search.
+# =============================================================================
+
+project:
+  name    : liquidity-stress-early-warning
+  version : v3_logreg
+  seed    : 42
+
+experiment:
+  stage   : v3_extended_models
+  version : v3_logreg
+  # Stage name must match the directory created by run_all_models.py.
+  # Artifacts will land in:
+  #   outputs/experiments/v3_extended_models/logreg/run_YYYYMMDD_HHMMSS/
+
+data:
+  train_path : data/raw/Train.csv
+  test_path  : data/raw/Test.csv
+
+preprocessing:
+  clip_quantiles  : [0.001, 0.999]
+  enable_clipping : true
+  # CRITICAL: Logistic Regression is not scale-invariant.
+  # StandardScaler is fitted AFTER clipping so outlier values (pre-clip
+  # ratio explosions up to 1e12) do not corrupt the learned mean/std.
+  scale_features  : true
+  debug           : true
+
+cv:
+  n_splits : 5
+  shuffle  : true
+  random_state : 42
+  # Stratified K-Fold preserves the 15% positive rate in every fold.
+  # 5 folds gives 32K training / 8K validation rows per fold — enough
+  # for the saga solver to converge reliably.
+
+model:
+  name : logreg
+  params:
+    # ── Regularisation ────────────────────────────────────────────────────
+    penalty     : elasticnet
+    # ElasticNet combines L1 (sparsity) and L2 (stability on correlated
+    # features).  With 825 engineered features — many of which are
+    # correlated ratio/recency variants — pure L1 (Lasso) can arbitrarily
+    # zero one of two nearly-identical features.  ElasticNet avoids this
+    # by retaining correlated groups via the L2 component.
+
+    C           : 0.01
+    # Inverse regularisation strength.  Smaller = stronger regularisation.
+    # With 825 features and 40K rows, C=1.0 (sklearn default) is far too
+    # permissive and leads to overfitting on noisy ratio features.
+    # C=0.01 gives effective degrees of freedom ≈ C × n_features = 8.25,
+    # which is appropriate for this high-dimensional, sparse feature space.
+    # Optuna will search loguniform(1e-4, 1.0) to refine this.
+
+    l1_ratio    : 0.5
+    # Mixing parameter between L1 (l1_ratio=1.0) and L2 (l1_ratio=0.0).
+    # 0.5 = equal mix.  This is the safe starting point; Optuna will
+    # determine whether more sparsity (higher l1_ratio) or more grouping
+    # (lower l1_ratio) is optimal for our feature space.
+
+    # ── Solver ───────────────────────────────────────────────────────────
+    solver      : saga
+    # MANDATORY for elasticnet penalty.  saga is the only sklearn solver
+    # that supports all four penalties (l1, l2, elasticnet, none)
+    # simultaneously.  liblinear does not support elasticnet.
+    # sag is faster than saga but does not support l1/elasticnet.
+
+    max_iter    : 2000
+    # saga on 825 features with ~32K training rows per fold requires
+    # headroom to converge.  1000 is often insufficient for high-
+    # dimensional elasticnet problems.  2000 provides a safe ceiling
+    # without meaningful runtime cost (saga is fast per iteration).
+
+    tol         : 1.0e-4
+    # Convergence tolerance.  sklearn default.  Appropriate for this
+    # problem size.
+
+    # ── Class balance ─────────────────────────────────────────────────────
+    class_weight : balanced
+    # Equivalent to scale_pos_weight in GBMs.  With a 15% positive rate
+    # (6000 stress / 34000 non-stress), balanced weights the positive class
+    # by 34000/6000 = 5.6667 automatically.  This matches the verified
+    # scale_pos_weight used in all tuned GBM configs.
+
+    # ── Reproducibility & compute ─────────────────────────────────────────
+    random_state : 42
+    n_jobs       : -1
+    # n_jobs=-1 parallelises saga's gradient computations across all
+    # available CPU cores.  On Windows (Anaconda), this is safe for saga.
+
+training:
+  # LogisticRegression has no early stopping or eval_set.
+  # These keys are read by cv.py's train_model() but ignored for logreg.
+  # They are kept here for config schema consistency across all models.
+  early_stopping_rounds : null
+  verbose_eval          : null
+
+evaluation:
+  metrics:
+    logloss:
+      weight  : 0.6
+      minimize: true
+    roc_auc:
+      weight  : 0.4
+      minimize: false
+  # Competition formula: 0.6 * LogLoss + 0.4 * (1 - AUC). Lower is better.
+  # LogLoss is weighted 60% because the submission format requires
+  # calibrated probabilities, not just ranking accuracy.
+
+artifacts:
+  save_models     : true
+  save_importance : true
+  # Models saved to:
+  #   outputs/experiments/v3_extended_models/logreg/run_*/models/logreg/
+  #   logreg_fold_0.pkl ... logreg_fold_4.pkl  (joblib, standard sklearn)
+
+paths:
+  experiment_root : outputs/experiments
+  calibration_dir : outputs/calibration/logreg
+  multi_model_dir : outputs/multi_model
+
+# =============================================================================
+# Post-run checklist
+# =============================================================================
+# After running:
+#   python -m src.orchestration.run_all_models --configs configs/logreg_v1.yaml
+#
+# Validate in new notebook:
+#   1. OOF LogLoss  — expected: 0.35–0.45 (individually weaker than GBMs)
+#   2. OOF AUC      — expected: 0.82–0.88
+#   3. Composite    — expected: 0.22–0.25
+#   4. Pearson corr(logreg_oof, lgbm_oof) — TARGET < 0.82
+#      If correlation > 0.85: increase C (less regularisation) or decrease
+#      l1_ratio (more L2 grouping) and re-run.
+#   5. Calibration curve — expected to be well-calibrated without Platt.
+#      Will run new calibration notebook.
+# =============================================================================
