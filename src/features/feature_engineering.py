@@ -1077,13 +1077,15 @@ def _categorical_features(df: pd.DataFrame) -> Dict:
 
     # Earning pattern: deterministic label encode (sorted unique values)
     if "earning_pattern" in df.columns:
-        unique_patterns = sorted(df["earning_pattern"].dropna().unique())
-        pattern_map     = {v: i for i, v in enumerate(unique_patterns)}
+        series = df["earning_pattern"].astype(str)  # force safe type
+        unique_patterns = sorted(series.dropna().unique())
+        pattern_map = {v: i for i, v in enumerate(unique_patterns)}
+
         feats["earning_pattern_encoded"] = (
-            df["earning_pattern"].map(pattern_map).fillna(-1).astype(int)
+            series.map(pattern_map).fillna(-1).astype(int).values
         )
 
-    # Smartphone ownership binary
+    # Smartphone ownership binary 
     if "smartphone" in df.columns:
         feats["has_smartphone"] = (
             df["smartphone"].str.strip().str.lower().isin(["yes", "1", "true"])
