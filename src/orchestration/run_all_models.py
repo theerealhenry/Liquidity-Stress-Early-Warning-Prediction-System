@@ -9,7 +9,7 @@ Responsibilities
 - Resolve project root deterministically (no CWD dependency)
 - Load and validate per-model YAML configs
 - Pre-flight dependency check per model family (catches missing
-  pytorch-tabnet before wasting time on feature engineering)
+  pytorch_tabnet before wasting time on feature engineering)
 - Execute LightGBM / XGBoost / CatBoost / LogisticRegression / TabNet
   training in-process
 - Windows-safe logging (UTF-8, no emoji in file/console handlers)
@@ -22,7 +22,7 @@ Output contract (aligned with project output spec)
 outputs/experiments/<stage>/<model>/run_YYYYMMDD_HHMMSS/
     models/              fold-level serialised models
                          GBMs + LogReg: joblib .pkl per fold
-                         TabNet: pytorch-tabnet .zip per fold
+                         TabNet: pytorch_tabnet .zip per fold
                          (cv.py handles serialisation routing transparently)
     oof_preds.npy        out-of-fold predictions
     y_true.npy           ground-truth labels
@@ -60,7 +60,7 @@ v1.0   LightGBM / XGBoost / CatBoost orchestration.
 v2.0   NEW: LogisticRegression and TabNet support.
        - DEFAULT_CONFIGS updated to include logreg_v1.yaml and tabnet_v1.yaml
        - Pre-flight dependency check per model family with actionable
-         error messages (catches missing pytorch-tabnet before feature
+         error messages (catches missing pytorch_tabnet before feature
          engineering runs)
        - Model-aware config validation: enforces scale_features=true for
          logreg and tabnet, preventing silent unscaled-data failures
@@ -121,7 +121,7 @@ _MODEL_DEPENDENCIES: Dict[str, tuple] = {
     "xgboost":  ("xgboost",        "xgboost",                   "pip install xgboost"),
     "catboost": ("catboost",        "catboost",                  "pip install catboost"),
     "logreg":   ("scikit-learn",    "sklearn.linear_model",      "pip install scikit-learn"),
-    "tabnet":   ("pytorch-tabnet",  "pytorch_tabnet.tab_model",  "pip install pytorch-tabnet torch"),
+    "tabnet":   ("pytorch_tabnet",  "pytorch_tabnet.tab_model",  "pip install pytorch_tabnet torch"),
 }
 
 # ── Approximate runtime class per model on CPU ────────────────────────────────

@@ -1,0 +1,46 @@
+# =============================================================================
+# Liquidity Stress Early Warning System
+# Production ML Requirements
+# Python 3.10 Recommended
+# =============================================================================
+
+# Core Scientific Stack
+numpy
+pandas
+scipy
+
+# Machine Learning
+scikit-learn
+lightgbm
+xgboost
+catboost
+
+# Deep Learning / Neural Nets
+torch
+torchvision
+torchaudio
+pytorch-tabnet
+
+# Experimentation / Optimization
+optuna
+mlflow
+
+# Statistics / Analysis
+statsmodels
+
+# Explainability
+shap
+
+# Visualization
+matplotlib
+seaborn
+
+# Utilities
+joblib
+tqdm
+pyyaml
+
+# API / Deployment
+fastapi
+uvicorn
+pydantic
