@@ -405,9 +405,13 @@ def load_oof_artifacts(config: EnsembleConfig) -> Dict[str, np.ndarray]:
             )
         arr = np.load(path)
 
-        # Integrity checks
-        assert len(arr) == n, \
-            f"Shape mismatch: y_true has {n} rows, {m} OOF has {len(arr)}"
+        # Integrity checks — explicit ValueError, not assert (assert is
+        # disabled under python -O and must never guard production paths).
+        if len(arr) != n:
+            raise ValueError(
+                f"Shape mismatch: y_true has {n} rows, {m} OOF has {len(arr)}. "
+                f"Re-run the calibration notebook to regenerate this artefact."
+            )
         if np.isnan(arr).any():
             raise ValueError(f"NaN values detected in {m} OOF predictions.")
         if np.isinf(arr).any():
@@ -615,10 +619,12 @@ def _build_meta_features(
         feature_names.append("inter_model_disagreement")
 
     if config.use_raw_features and extra_features is not None:
-        assert extra_features.shape[0] == meta_X.shape[0], (
-            f"extra_features row count {extra_features.shape[0]} "
-            f"does not match OOF row count {meta_X.shape[0]}"
-        )
+        if extra_features.shape[0] != meta_X.shape[0]:
+            raise ValueError(
+                f"extra_features row count ({extra_features.shape[0]}) "
+                f"does not match OOF row count ({meta_X.shape[0]}). "
+                "Ensure extra_features is aligned to the training set."
+            )
         meta_X = np.hstack([meta_X, extra_features])
         for i in range(extra_features.shape[1]):
             feature_names.append(f"shap_raw_feature_{i}")
@@ -767,6 +773,18 @@ def calibrated_stacking(
 
     Uses nested CV Platt (5 folds) for an honest calibrated OOF estimate.
     The final_calibrator (fitted on all data) is saved for test inference.
+
+    Known limitation — fold misalignment:
+        The Platt CV folds here are NOT aligned to the stacking CV folds
+        that produced stacking_oof.  Each calibration fold's held-out rows
+        were predicted by meta-models trained on overlapping (but not
+        identical) samples from the stacking phase.  The resulting optimism
+        is negligible in practice (the Platt calibrator has only 2 free
+        parameters across 40k rows), but treat calibrated_stacking scores
+        as a lower-bound estimate rather than a perfectly honest OOF score.
+        The rigorous fix — calibrating within each stacking outer fold —
+        requires restructuring stacking_ensemble() to expose per-fold
+        predictions before aggregation.  Deferred post-competition.
 
     Returns
     -------
@@ -942,10 +960,18 @@ def save_ensemble_artifacts(
             for m in results.strategy_metrics
         ],
         "meta_model_summary": {
-            "C"              : config.meta_C,
-            "solver"         : config.meta_solver,
-            "use_disagreement": config.use_disagreement,
-            "use_raw_features": config.use_raw_features,
+            "C"                 : config.meta_C,
+            "solver"            : config.meta_solver,
+            "use_disagreement"  : config.use_disagreement,
+            "use_raw_features"  : config.use_raw_features,
+            # Explicit feature order so any future reload is self-describing.
+            # The meta-model's coef_[0] indices map to this list in order.
+            "meta_feature_order": (
+                list(MODEL_NAMES)
+                + (["inter_model_disagreement"] if config.use_disagreement else [])
+                + ([f"shap_raw_feature_{i}" for i in range(config.top_k_raw_features)]
+                   if config.use_raw_features else [])
+            ),
         },
     }
     with open(run_dir / "metadata.json", "w") as f:
@@ -1082,13 +1108,16 @@ def run_ensemble_pipeline(
             results.best_score    = m["score"]
             results.best_strategy = m["name"]
 
-    # ── 7. Save all artefacts ─────────────────────────────────────────────────
+    # ── 7. Record runtime BEFORE saving — metadata.json must capture it ───────
+    # (Bug fix: previously set after save, causing metadata to always record 0.0)
+    results.runtime_sec = time.perf_counter() - start_time
+
+    # ── 8. Save all artefacts ─────────────────────────────────────────────────
     save_ensemble_artifacts(
         results, meta_model, meta_calibrator,
         coefficients, corr_matrix, config, run_dir
     )
 
-    results.runtime_sec = time.perf_counter() - start_time
     print_results_table(results)
 
     return results
@@ -1202,6 +1231,16 @@ class EnsembleInference:
         np.ndarray of shape (n,) — final ensemble probabilities
         """
         # Step 1: per-model Platt calibration
+        # Validate all input arrays have equal length before any computation.
+        # Silent misalignment here would produce a corrupt submission with no error.
+        lengths = {m: len(raw_preds_per_model[m]) for m in MODEL_NAMES}
+        unique_lengths = set(lengths.values())
+        if len(unique_lengths) != 1:
+            raise ValueError(
+                f"Inconsistent prediction array lengths across models: {lengths}. "
+                "All models must produce predictions for the same number of rows."
+            )
+
         calibrated: Dict[str, np.ndarray] = {}
         for m in MODEL_NAMES:
             if m not in raw_preds_per_model:
