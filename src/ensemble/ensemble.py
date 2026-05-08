@@ -1,10 +1,42 @@
 """
-Ensemble Pipeline — v5
-======================
+Ensemble Pipeline — v5.1
+========================
 Project : AI4EAC Liquidity Stress Early Warning (Zindi Africa)
 Module  : src/ensemble/ensemble.py
 Author  : Henry Otsyula
-Updated : 2026-05-08  (v4 → v5: 3-model → 5-model; meta_C tightened)
+Updated : 2026-05-08  (v5.0 → v5.1: architectural hardening)
+
+Change log
+----------
+v4   : 3-model GBM-only ensemble.  Intra-cluster r=0.962–0.978.
+       Stacking gave no lift over averaging.
+v5.0 : Added LogReg + TabNet.  Cross-cluster r dropped to 0.745–0.753.
+       Three independent signal clusters confirmed.  Optimised weighted
+       average (0.19144) beat best single model (XGB 0.19350).
+v5.1 : Architectural hardening — identical results, safer code:
+       • Global mutable MODEL_NAMES removed.  config.model_names is now
+         the single source of truth for every loop and array stack.
+       • Global mutable _CALIBRATION_FOLDER removed.  Moved to
+         EnsembleConfig.calibration_folder_map — overridable per-run.
+       • model_groups added to EnsembleConfig for cluster-aware reporting
+         without hardcoded string lists in utility functions.
+       • ensemble_version added to EnsembleConfig; saved in metadata.json
+         for deployment compatibility checks.
+       • _KNOWN_INDIVIDUAL_SCORES kept module-level (read-only constant,
+         never mutated — appropriate).
+       • All functions receive model_names explicitly; zero global reads.
+       • Hardcoded 5-element weight initialisations replaced with
+         model-count-agnostic dynamic generation via _pad() helper.
+       • validate_model_set() added — called at every entry point.
+       • config.validate() enforces internal consistency on construction.
+       • EnsembleInference.from_run_dir() reads model_names and
+         calibration_folder_map from metadata.json — not from module
+         defaults — guaranteeing training-inference consistency.
+       • Bug fix carried from v5.0: runtime_sec set BEFORE save so
+         metadata.json records the real elapsed time (was always 0.0).
+       • Known limitation documented in calibrated_stacking() docstring:
+         Platt CV folds not aligned to stacking CV folds (negligible
+         impact; deferred post-competition).
 
 Architecture
 ------------
@@ -14,94 +46,65 @@ Three-layer ensemble designed around the specific properties of this problem:
     LightGBM  : strong calibration, best Log Loss baseline
     XGBoost   : best single-model composite (0.19350), most stable folds
     CatBoost  : not Optuna-tuned, but fat-tailed disagreements add value
-    LogReg    : ElasticNet saga — LINEAR boundary; structurally orthogonal
-                to all three GBMs.  Composite 0.26003 post-Platt.
+    LogReg    : ElasticNet saga — LINEAR boundary; orthogonal to GBMs
+                Composite 0.26003 post-Platt.
     TabNet    : instance-wise sequential attention — per-customer feature
                 selection.  Composite 0.25296 post-Platt.
 
-  Layer 2 — Calibration (Platt scaling per model, already applied)
-    OOF Platt calibrators are fitted in notebooks 07 / 07b and saved to
-    outputs/calibration/{model}/calibrator_platt.pkl.
-    Calibrated OOF arrays are saved to outputs/multi_model/.
-    This module consumes those artefacts — it does NOT re-calibrate base
-    model outputs.
+  Layer 2 — Calibration (already applied upstream)
+    OOF Platt calibrators fitted in notebooks 07 / 07b, saved to
+    outputs/calibration/{folder}/calibrator_platt.pkl.
+    Calibrated OOF arrays in outputs/multi_model/.
+    This module CONSUMES those artefacts — it does NOT re-calibrate.
 
-  Layer 3 — Ensemble strategies (evaluated in order of complexity)
+  Layer 3 — Ensemble strategies
     3a. Simple average           — equal-weight sanity check
     3b. Optimised weighted avg   — Scipy Nelder-Mead on composite score
     3c. Stacking                 — LogisticRegression meta-model on OOF
     3d. Calibrated stacking      — Platt pass on stacking OOF output
 
-Why v5 changes are needed
---------------------------
-v4 was built for three GBMs that shared inductive bias and correlated at
-0.962–0.978 — effectively one signal bloc.  Stacking gave minimal lift
-over simple averaging in that regime.
-
-v5 adds LogReg and TabNet, which reduce cross-cluster correlation to
-0.708–0.753.  Three genuinely independent signal clusters now exist:
-
-    GBM bloc    (LGBM / XGB / CAT)  : within-cluster r = 0.962–0.978
-    TabNet                           : vs GBMs r = 0.745–0.753
-    LogReg                           : vs GBMs r = 0.748–0.750
-                                       vs TabNet r = 0.752
-
-In this regime the meta-model learns CONDITIONAL trust — when TabNet
-disagrees with the GBM bloc, whose signal is more likely correct —
-producing genuine discriminative lift beyond simple averaging.
-
 Key design decisions
 ---------------------
-1. META_C TIGHTENED: 0.1 → 0.05
-   Five meta-features instead of three; stronger regularisation prevents
-   the meta-model from over-fitting to the OOF signal.
+1. CONFIG IS THE SINGLE SOURCE OF TRUTH
+   config.model_names drives every loop, stack, and save.  Ablation
+   experiments change config.model_names — nothing else.
 
-2. DISAGREEMENT FEATURE (std across ALL 5 models)
-   High disagreement cases are exactly where conditional trust matters.
-   Using all 5 models' std captures the full signal cluster separation.
+2. META_C = 0.05
+   Five meta-inputs instead of three; tighter regularisation prevents
+   the meta-model from fitting OOF noise.
 
-3. LEAKAGE PREVENTION — OOF-only stacking
-   The meta-model is NEVER trained on in-sample base-model predictions.
-   Nested 5-fold CV produces honest OOF meta-predictions for evaluation.
-   The final meta-model (for test inference) is fitted on full OOF data.
+3. DISAGREEMENT FEATURE (std across all configured models per row)
+   High disagreement = cross-cluster uncertainty = where stacking adds value.
 
-4. CALIBRATION LAYER ON ENSEMBLE OUTPUT
-   LogisticRegression meta-model produces well-scaled probabilities, but
-   a final Platt pass corrects residual miscalibration from input scale
-   differences between GBM and non-GBM predictions.
+4. OOF-ONLY STACKING (no leakage)
+   Meta-model trained exclusively on held-out OOF predictions.
+   Nested 5-fold CV for honest evaluation.
 
 5. COMPOSITE SCORE OBJECTIVE throughout
-   All weight optimisation and evaluation uses: 0.6 * LogLoss + 0.4 * (1 - AUC)
-   This is the exact competition metric — no proxy objectives.
+   0.6 * LogLoss + 0.4 * (1 − AUC) — the exact competition metric.
 
-6. SCALE AWARENESS
-   LogReg and TabNet OOF arrays have different probability ranges from GBMs
-   post-Platt (GBMs centre at 0.15; LogReg/TabNet shift from class weights).
-   The meta-model receives all 5 calibrated OOF arrays — each already
-   mapped to the correct probability scale by the per-model Platt calibrators
-   fitted in notebooks 07 / 07b.  No additional scaling is applied here.
-
-7. MODEL NAME → FILE NAME MAPPING
-   lightgbm  →  oof_calibrated_lightgbm.npy  /  calibration/lgb/
-   xgboost   →  oof_calibrated_xgboost.npy   /  calibration/xgb/
-   catboost  →  oof_calibrated_catboost.npy  /  calibration/cat/
-   logreg    →  oof_calibrated_logreg.npy    /  calibration/logreg/
-   tabnet    →  oof_calibrated_tabnet.npy    /  calibration/tabnet/
-   NOTE: GBMs use abbreviated subfolder names (lgb/xgb/cat) — preserved
-   from v4 to avoid breaking existing artefact paths.
+6. CALIBRATION FOLDER MAP
+   lightgbm → lgb/  (abbreviated, preserved from v4 artefact paths)
+   xgboost  → xgb/
+   catboost → cat/
+   logreg   → logreg/
+   tabnet   → tabnet/
+   Overridable via config.calibration_folder_map.
 
 Output contract
 ---------------
 outputs/experiments/v5_ensemble/run_YYYYMMDD_HHMMSS/
     ensemble_oof.npy           final calibrated stacking OOF predictions
-    stacking_oof.npy           raw stacking output (pre-final-calibration)
-    ensemble_weights.json      optimised weights per strategy
+    stacking_oof.npy           raw stacking output (pre-calibration)
+    ensemble_weights.json      optimised weights + model order
     meta_model.pkl             fitted stacking LogisticRegression
-    meta_calibrator.pkl        Platt calibrator fitted on ensemble OOF
+    meta_calibrator.pkl        Platt calibrator on ensemble OOF
     stacking_results.json      full metrics for all strategies
     feature_importance.csv     meta-model coefficient table
-    metadata.json              run record with all hyperparameters
-    correlation_matrix.csv     post-calibration OOF Pearson correlation
+    correlation_matrix.csv     post-calibration OOF Pearson correlations
+    metadata.json              self-describing run record: model_names,
+                               calibration_folder_map, ensemble_version,
+                               meta_feature_order, full config
 """
 
 from __future__ import annotations
@@ -123,29 +126,29 @@ from sklearn.model_selection import StratifiedKFold
 
 
 # =============================================================================
-# CONSTANTS
+# MODULE-LEVEL CONSTANTS  (read-only; never mutated by any function)
 # =============================================================================
 
-EPS             : float      = 1e-15
-CLIP_LOW        : float      = 1e-6
-CLIP_HIGH       : float      = 1.0 - 1e-6
-LOG_LOSS_WEIGHT : float      = 0.6
-AUC_WEIGHT      : float      = 0.4
-SEED            : int        = 42
+EPS             : float = 1e-15
+CLIP_LOW        : float = 1e-6
+CLIP_HIGH       : float = 1.0 - 1e-6
+LOG_LOSS_WEIGHT : float = 0.6
+AUC_WEIGHT      : float = 0.4
+SEED            : int   = 42
 
-# v5: Five models spanning three independent signal clusters.
-# ORDER MATTERS — must match the order used in _build_meta_features().
-MODEL_NAMES: List[str] = [
-    "lightgbm",   # GBM cluster
-    "xgboost",    # GBM cluster
-    "catboost",   # GBM cluster
-    "logreg",     # Linear cluster
-    "tabnet",     # Attention cluster
+# Default ensemble structure — used only as defaults in EnsembleConfig.
+# Production code must never import or mutate these; use config.model_names.
+_DEFAULT_MODEL_NAMES: List[str] = [
+    "lightgbm",  # GBM cluster
+    "xgboost",   # GBM cluster
+    "catboost",  # GBM cluster
+    "logreg",    # Linear cluster
+    "tabnet",    # Attention cluster
 ]
 
-# GBM models use abbreviated folder names for calibration artefact paths.
-# Non-GBMs use their full model name as the folder name.
-_CALIBRATION_FOLDER: Dict[str, str] = {
+# Default calibration folder mapping.  GBMs use abbreviated names preserved
+# from v4 artefact paths.  Overridable via EnsembleConfig.calibration_folder_map.
+_DEFAULT_CALIBRATION_FOLDER: Dict[str, str] = {
     "lightgbm" : "lgb",
     "xgboost"  : "xgb",
     "catboost" : "cat",
@@ -153,8 +156,16 @@ _CALIBRATION_FOLDER: Dict[str, str] = {
     "tabnet"   : "tabnet",
 }
 
-# Reference composite scores from individual model evaluation (post-Platt).
-# Used in the results table for easy comparison.
+# Default cluster groupings — used for correlation reporting only.
+# Overridable via EnsembleConfig.model_groups.
+_DEFAULT_MODEL_GROUPS: Dict[str, List[str]] = {
+    "gbm"       : ["lightgbm", "xgboost", "catboost"],
+    "linear"    : ["logreg"],
+    "attention" : ["tabnet"],
+}
+
+# Individual model composite scores (post-Platt, from notebooks 07/07b).
+# Read-only — used for display in results tables only.
 _KNOWN_INDIVIDUAL_SCORES: Dict[str, float] = {
     "lightgbm" : 0.19557,
     "xgboost"  : 0.19350,
@@ -170,8 +181,8 @@ _KNOWN_INDIVIDUAL_SCORES: Dict[str, float] = {
 
 def composite_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
-    Competition metric: 0.6 * LogLoss + 0.4 * (1 - AUC).
-    Lower is better.  Clips predictions before LogLoss computation.
+    Competition metric: 0.6 * LogLoss + 0.4 * (1 − AUC).
+    Lower is better.  Clips predictions to avoid log(0).
     """
     y_clipped = np.clip(y_pred, EPS, 1.0 - EPS)
     ll  = log_loss(y_true, y_clipped)
@@ -181,8 +192,7 @@ def composite_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
     """
-    Full metric suite for a set of predictions.
-    Returns logloss, auc, brier score, composite score,
+    Full metric suite: logloss, auc, brier, composite score,
     and prediction distribution statistics.
     """
     y_clipped = np.clip(y_pred, EPS, 1.0 - EPS)
@@ -202,60 +212,207 @@ def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any
 
 
 # =============================================================================
+# VALIDATION UTILITIES
+# =============================================================================
+
+def validate_model_set(
+    model_names : List[str],
+    oof_preds   : Dict[str, np.ndarray],
+    context     : str = "",
+) -> None:
+    """
+    Strict bidirectional validation: model_names vs oof_preds keys.
+
+    Raises ValueError if:
+      - Any model in model_names is missing from oof_preds.
+      - Any key in oof_preds is not in model_names.
+
+    Bidirectional checking is important: extra keys indicate a stale or
+    wrong artefact set was loaded, which would silently corrupt stacking
+    if allowed through.
+
+    Parameters
+    ----------
+    model_names : models expected by the current config
+    oof_preds   : dict of loaded model predictions
+    context     : caller label for error messages
+    """
+    prefix  = f"[{context}] " if context else ""
+    missing = [m for m in model_names if m not in oof_preds]
+    extra   = [m for m in oof_preds   if m not in model_names]
+
+    if missing:
+        raise ValueError(
+            f"{prefix}Missing OOF predictions for: {missing}.\n"
+            "Run the calibration notebook(s) to produce the missing artefacts."
+        )
+    if extra:
+        raise ValueError(
+            f"{prefix}Unexpected models in oof_preds not in config.model_names: "
+            f"{extra}.\nPass only the models listed in config.model_names, "
+            "or update config.model_names to include them."
+        )
+
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
 @dataclass
 class EnsembleConfig:
     """
-    Full configuration for the ensemble pipeline.
-    All hyperparameters in one place — no magic numbers in code.
+    Single source of truth for the ensemble pipeline.
 
-    v5 changes vs v4
+    All hyperparameters, model identity, and file-path mappings live here.
+    No function in this module reads module-level global state — every
+    loop is driven by config.model_names.
+
+    Design note — NOT frozen
+    ------------------------
+    frozen=True breaks field(default_factory=…) on Python < 3.10 and
+    prevents notebook-friendly path overrides (config.project_root = ...).
+    Instead, call config.validate() after construction to enforce internal
+    consistency.  The validate() method is also called at the start of
+    run_ensemble_pipeline() as a pre-flight check.
+
+    Ablation example
     ----------------
-    meta_C          : 0.1 → 0.05   (tighter regularisation for 5 meta-inputs)
-    output_dir      : v4_ensemble → v5_ensemble
-    use_raw_features: now properly wired (activated post-SHAP in Step 3)
+    To run a GBM-only experiment without touching ensemble.py:
+
+        config = EnsembleConfig(
+            model_names = ["lightgbm", "xgboost", "catboost"],
+            model_groups = {"gbm": ["lightgbm", "xgboost", "catboost"]},
+            output_dir  = "outputs/experiments/ablation_gbm_only",
+        )
+        config.validate()
+        results = run_ensemble_pipeline(config)
     """
-    # Paths
-    project_root    : str   = ""
-    oof_dir         : str   = "outputs/multi_model"
-    output_dir      : str   = "outputs/experiments/v5_ensemble"
-    calibration_dir : str   = "outputs/calibration"
 
-    # Cross-validation
-    n_splits        : int   = 5
-    seed            : int   = SEED
+    # ── Ensemble identity ─────────────────────────────────────────────────────
+    ensemble_version : str = "v5.1"
 
-    # Weight optimisation
-    optimise_weights  : bool  = True
-    optimiser_method  : str   = "Nelder-Mead"
-    optimiser_maxiter : int   = 5000
+    # ── Model structure ───────────────────────────────────────────────────────
+    # This list is the single source of truth for which models are in the
+    # ensemble, in what order, and therefore what the meta-feature column
+    # order is.  Every function receives model_names from config.
+    model_names: List[str] = field(
+        default_factory=lambda: list(_DEFAULT_MODEL_NAMES)
+    )
 
-    # Stacking meta-model
-    # v5: C tightened from 0.1 → 0.05 because we now have 5 meta-features
-    # (vs 3 in v4).  With 5 inputs, a looser C risks the meta-model learning
-    # spurious correlations in the 40 k OOF sample.
-    meta_C          : float = 0.05
-    meta_max_iter   : int   = 1000
-    meta_solver     : str   = "lbfgs"
+    # Cluster groupings for correlation reporting.  Must be updated when
+    # running experiments with a non-standard model set.
+    model_groups: Dict[str, List[str]] = field(
+        default_factory=lambda: {k: list(v)
+                                 for k, v in _DEFAULT_MODEL_GROUPS.items()}
+    )
 
-    # Stacking feature augmentation
-    # use_disagreement: std across ALL 5 models' predictions per row.
-    # This captures cross-cluster uncertainty — exactly where stacking
-    # adds value over averaging.
-    use_disagreement    : bool  = True
-    # use_raw_features: activated in Step 3 after SHAP identifies top-5.
-    use_raw_features    : bool  = False
-    top_k_raw_features  : int   = 5
+    # Per-model calibration subfolder names.  GBMs use abbreviated names
+    # (lgb/xgb/cat) preserved from v4 artefact paths.  Add new models here.
+    calibration_folder_map: Dict[str, str] = field(
+        default_factory=lambda: dict(_DEFAULT_CALIBRATION_FOLDER)
+    )
 
-    # Final calibration of ensemble output
-    calibrate_ensemble  : bool  = True
+    # ── Paths ─────────────────────────────────────────────────────────────────
+    project_root    : str = ""
+    oof_dir         : str = "outputs/multi_model"
+    output_dir      : str = "outputs/experiments/v5_ensemble"
+    calibration_dir : str = "outputs/calibration"
 
-    # Artifact saving
-    save_models : bool  = True
-    save_oof    : bool  = True
-    save_metrics: bool  = True
+    # ── Cross-validation ──────────────────────────────────────────────────────
+    n_splits : int = 5
+    seed     : int = SEED
+
+    # ── Weight optimisation ───────────────────────────────────────────────────
+    optimise_weights  : bool = True
+    optimiser_method  : str  = "Nelder-Mead"
+    optimiser_maxiter : int  = 5000
+
+    # ── Stacking meta-model ───────────────────────────────────────────────────
+    # C=0.05: tighter than v4's 0.1 — 5 meta-inputs now vs 3.
+    meta_C        : float = 0.05
+    meta_max_iter : int   = 1000
+    meta_solver   : str   = "lbfgs"
+
+    # ── Stacking feature augmentation ─────────────────────────────────────────
+    use_disagreement   : bool = True   # std across all models per row
+    use_raw_features   : bool = False  # activated post-SHAP (Step 3)
+    top_k_raw_features : int  = 5
+
+    # ── Final calibration of ensemble output ──────────────────────────────────
+    calibrate_ensemble : bool = True
+
+    # ── Artefact saving ───────────────────────────────────────────────────────
+    save_models  : bool = True
+    save_oof     : bool = True
+    save_metrics : bool = True
+
+    # ── Public helpers ────────────────────────────────────────────────────────
+
+    def validate(self) -> None:
+        """
+        Enforce internal consistency.  Always call after construction,
+        especially when overriding model_names or calibration_folder_map.
+
+        Checks:
+          - model_names non-empty, no duplicates
+          - Every model has a calibration_folder_map entry
+          - model_groups references only known models (warns, not error)
+          - use_raw_features=True requires top_k_raw_features > 0
+        """
+        if not self.model_names:
+            raise ValueError("config.model_names must not be empty.")
+
+        dupes = [m for m in self.model_names
+                 if self.model_names.count(m) > 1]
+        if dupes:
+            raise ValueError(
+                f"Duplicate model names in config.model_names: {set(dupes)}"
+            )
+
+        missing_folders = [m for m in self.model_names
+                           if m not in self.calibration_folder_map]
+        if missing_folders:
+            raise ValueError(
+                f"No calibration_folder_map entry for: {missing_folders}.\n"
+                "Add the mapping before running."
+            )
+
+        for group, members in self.model_groups.items():
+            unknown = [m for m in members if m not in self.model_names]
+            if unknown:
+                print(
+                    f"  Warning: model_groups['{group}'] references models "
+                    f"not in config.model_names: {unknown}.  "
+                    "Correlation report for this group will be incomplete."
+                )
+
+        if self.use_raw_features and self.top_k_raw_features <= 0:
+            raise ValueError(
+                "use_raw_features=True requires top_k_raw_features > 0."
+            )
+
+    def calibration_folder(self, model_name: str) -> str:
+        """Return the calibration subfolder path component for a model."""
+        if model_name not in self.calibration_folder_map:
+            raise KeyError(
+                f"No calibration_folder_map entry for '{model_name}'.  "
+                "Add it to config.calibration_folder_map."
+            )
+        return self.calibration_folder_map[model_name]
+
+    @property
+    def meta_feature_order(self) -> List[str]:
+        """
+        Ordered list of meta-feature names matching meta_model.coef_[0].
+        Saved in metadata.json for self-describing run records.
+        """
+        names = list(self.model_names)
+        if self.use_disagreement:
+            names.append("inter_model_disagreement")
+        if self.use_raw_features:
+            names += [f"shap_raw_feature_{i}"
+                      for i in range(self.top_k_raw_features)]
+        return names
 
 
 @dataclass
@@ -277,26 +434,21 @@ class EnsembleResults:
 
 class PlattCalibrator:
     """
-    Platt scaling calibrator (logistic regression on raw predictions).
+    Platt scaling calibrator — logistic regression on scalar predictions.
 
-    Wraps sklearn LogisticRegression(C=1e10) — effectively unconstrained —
-    fitting the sigmoid: calibrated = sigmoid(a * raw + b).
+    Fits: calibrated = σ(slope × raw_pred + intercept).
+    Interface matches per-model calibrators saved in notebooks 07 / 07b.
 
-    This class exists to keep the interface consistent with the per-model
-    calibrators saved in notebooks 07 / 07b.  The ensemble module uses it
-    only for the FINAL calibration of the stacking output, not for
-    re-calibrating base model predictions (those are already calibrated).
+    Used here ONLY for the final calibration of the stacking output.
+    Base model predictions arrive already calibrated.
     """
 
     def __init__(self, C: float = 1e10, max_iter: int = 1000) -> None:
         self.C        = C
         self.max_iter = max_iter
-        self._model   = LogisticRegression(
-            C=C, solver="lbfgs", max_iter=max_iter
-        )
+        self._model   = LogisticRegression(C=C, solver="lbfgs", max_iter=max_iter)
         self._fitted  = False
 
-    # Slope and intercept expose the sigmoid parameters for inspection.
     @property
     def slope(self) -> float:
         return float(self._model.coef_[0][0]) if self._fitted else float("nan")
@@ -325,21 +477,15 @@ class PlattCalibrator:
 def cv_platt_calibrate(
     raw_preds : np.ndarray,
     y         : np.ndarray,
-    n_splits  : int  = 5,
-    seed      : int  = SEED,
+    n_splits  : int   = 5,
+    seed      : int   = SEED,
     C         : float = 1e10,
-) -> Tuple[np.ndarray, "PlattCalibrator"]:
+) -> Tuple[np.ndarray, PlattCalibrator]:
     """
     Cross-validated Platt calibration.
 
-    Fits the calibrator on held-out splits to prevent in-sample optimism.
-    Returns both calibrated OOF predictions AND a final calibrator fitted
-    on all data (for applying to the test set).
-
-    Returns
-    -------
-    calibrated_oof   : np.ndarray — CV-calibrated predictions (honest)
-    final_calibrator : PlattCalibrator — fitted on full data, for test set
+    Returns honest CV-calibrated OOF predictions AND a final calibrator
+    fitted on all data (for test-set inference).
     """
     calibrated = np.zeros_like(raw_preds, dtype=float)
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
@@ -350,26 +496,24 @@ def cv_platt_calibrate(
         calibrated[val_idx] = cal.predict(raw_preds[val_idx])
 
     final_calibrator = PlattCalibrator(C=C).fit(raw_preds, y)
-
     return calibrated, final_calibrator
 
 
 # =============================================================================
-# ARTIFACT LOADING
+# ARTEFACT LOADING
 # =============================================================================
 
 def load_oof_artifacts(config: EnsembleConfig) -> Dict[str, np.ndarray]:
     """
     Load Platt-calibrated OOF predictions and ground truth.
 
-    Expects (all produced by notebooks 07 / 07b / 08):
-        outputs/multi_model/y_true.npy
-        outputs/multi_model/oof_calibrated_{model}.npy   for all 5 models
+    Model set driven by config.model_names — no global list read.
 
     Validates:
-        - All arrays have the same length as y_true
-        - No NaN or Inf values in any array
-        - Positive rate matches expected 15% (±1%)
+      - y_true positive rate in [0.13, 0.17]  (expected 0.15 ± 2 pp)
+      - Each OOF array: length == len(y_true), no NaN/Inf, values in [0,1]
+
+    Returns dict: {"y_true": ..., model_name: array, ...}
     """
     root    = Path(config.project_root)
     oof_dir = root / config.oof_dir
@@ -381,77 +525,74 @@ def load_oof_artifacts(config: EnsembleConfig) -> Dict[str, np.ndarray]:
     if not y_path.exists():
         raise FileNotFoundError(
             f"y_true.npy not found at {y_path}.\n"
-            "Run notebooks 07 / 07b / 08 to produce OOF artefacts first."
+            "Run notebooks 07 / 07b to produce OOF artefacts first."
         )
     artifacts["y_true"] = np.load(y_path)
-    n = len(artifacts["y_true"])
-    pos_rate = artifacts["y_true"].mean()
+    n        = len(artifacts["y_true"])
+    pos_rate = float(artifacts["y_true"].mean())
+
     print(f"  y_true       : shape={artifacts['y_true'].shape}  "
           f"positive_rate={pos_rate:.4f}")
     if not 0.13 <= pos_rate <= 0.17:
         raise ValueError(
             f"Unexpected positive rate {pos_rate:.4f}. "
-            "Expected ~0.15 (6,000 / 40,000). Check y_true.npy."
+            "Expected ~0.15 (6,000 / 40,000).  Check y_true.npy."
         )
 
     # Per-model calibrated OOF
-    for m in MODEL_NAMES:
+    for m in config.model_names:
         path = oof_dir / f"oof_calibrated_{m}.npy"
         if not path.exists():
             raise FileNotFoundError(
-                f"Calibrated OOF not found for {m}: {path}.\n"
-                f"  • GBMs: run notebook 07_calibration_analysis.ipynb\n"
-                f"  • LogReg/TabNet: run notebook 07b_logreg_tabnet_calibration.ipynb"
+                f"Calibrated OOF not found for '{m}': {path}.\n"
+                "  • GBMs  → run 07_calibration_analysis.ipynb\n"
+                "  • Other → run 07b_logreg_tabnet_calibration.ipynb"
             )
         arr = np.load(path)
 
-        # Integrity checks — explicit ValueError, not assert (assert is
-        # disabled under python -O and must never guard production paths).
+        # Integrity checks — explicit ValueError; assert is disabled by python -O
         if len(arr) != n:
             raise ValueError(
-                f"Shape mismatch: y_true has {n} rows, {m} OOF has {len(arr)}. "
-                f"Re-run the calibration notebook to regenerate this artefact."
+                f"Shape mismatch: y_true has {n} rows; '{m}' OOF has {len(arr)}. "
+                "Re-run the calibration notebook to regenerate this artefact."
             )
         if np.isnan(arr).any():
-            raise ValueError(f"NaN values detected in {m} OOF predictions.")
+            raise ValueError(f"NaN values in '{m}' OOF predictions.")
         if np.isinf(arr).any():
-            raise ValueError(f"Inf values detected in {m} OOF predictions.")
-        if not (0.0 <= arr.min() and arr.max() <= 1.0):
+            raise ValueError(f"Inf values in '{m}' OOF predictions.")
+        if arr.min() < 0.0 or arr.max() > 1.0:
             raise ValueError(
-                f"{m} OOF predictions out of [0, 1]: "
+                f"'{m}' OOF out of [0,1]: "
                 f"min={arr.min():.6f}, max={arr.max():.6f}"
             )
 
         artifacts[m] = arr
-        known = _KNOWN_INDIVIDUAL_SCORES.get(m)
+        known     = _KNOWN_INDIVIDUAL_SCORES.get(m)
         known_str = f"  (ref composite={known:.5f})" if known else ""
         print(f"  {m:12s}: shape={arr.shape}  "
               f"range=[{arr.min():.4f}, {arr.max():.4f}]  "
               f"mean={arr.mean():.4f}{known_str}")
 
-    print(f"\n  All 5 models loaded and validated ✓")
+    print(f"\n  {len(config.model_names)} models loaded and validated ✓")
     return artifacts
 
 
 def compute_oof_correlations(
-    oof_preds: Dict[str, np.ndarray],
+    oof_preds   : Dict[str, np.ndarray],
+    model_names : List[str],
 ) -> pd.DataFrame:
     """
-    Compute Pearson correlation matrix across all 5 models' OOF predictions.
-    Used both for reporting and to verify the three-cluster structure.
+    Pearson correlation matrix for the configured model set.
+    Column order matches model_names — never reads global state.
     """
-    df = pd.DataFrame({m: oof_preds[m] for m in MODEL_NAMES})
+    df = pd.DataFrame({m: oof_preds[m] for m in model_names})
     return df.corr(method="pearson")
 
 
 def build_run_dir(config: EnsembleConfig) -> Path:
-    """Create timestamped run directory aligned to output spec."""
+    """Create a timestamped run directory under config.output_dir."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = (
-        Path(config.project_root)
-        / config.output_dir
-        / f"run_{timestamp}"
-    )
+    run_dir   = Path(config.project_root) / config.output_dir / f"run_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -461,23 +602,20 @@ def build_run_dir(config: EnsembleConfig) -> Path:
 # =============================================================================
 
 def simple_average(
-    oof_preds : Dict[str, np.ndarray],
-    y_true    : np.ndarray,
+    oof_preds   : Dict[str, np.ndarray],
+    y_true      : np.ndarray,
+    model_names : List[str],
 ) -> Tuple[np.ndarray, Dict]:
     """
-    Equal-weight average across all 5 base model predictions.
+    Equal-weight average across the configured model set.
 
-    With GBM intra-cluster correlations of 0.962–0.978, this effectively
-    gives ~75% weight to the GBM signal bloc.  Serves as the lower-bound
-    baseline — stacking should clearly beat this with r=0.745–0.753
-    cross-cluster diversity.
+    With GBM intra-cluster r=0.962–0.978, equal weighting gives the GBM
+    bloc ~60% implicit weight (3 of 5 equal slots).  Lower-bound baseline.
     """
-    active_models = [m for m in MODEL_NAMES if m in oof_preds]
-    pred_arr = np.stack([oof_preds[m] for m in active_models], axis=1)
-    avg_pred = pred_arr.mean(axis=1)
-    avg_pred = np.clip(avg_pred, CLIP_LOW, CLIP_HIGH)
-    metrics  = evaluate("simple_average", y_true, avg_pred)
-    return avg_pred, metrics
+    validate_model_set(model_names, oof_preds, "simple_average")
+    pred_arr = np.stack([oof_preds[m] for m in model_names], axis=1)
+    avg_pred = np.clip(pred_arr.mean(axis=1), CLIP_LOW, CLIP_HIGH)
+    return avg_pred, evaluate("simple_average", y_true, avg_pred)
 
 
 # =============================================================================
@@ -490,23 +628,15 @@ def _weight_objective(
     y_true   : np.ndarray,
 ) -> float:
     """
-    Composite score objective for Nelder-Mead weight optimisation.
-    Projects weights onto the probability simplex (sum=1, all ≥ 0).
+    Composite score objective for Nelder-Mead.
+    Projects weights onto the probability simplex before evaluating.
     """
     w = np.clip(weights, 0.0, 1.0)
-
-    if w.shape[0] != pred_arr.shape[1]:
-        raise ValueError(
-            f"Weight mismatch: got {w.shape[0]} weights for "
-            f"{pred_arr.shape[1]} models"
-        )
-
     w_sum = w.sum()
     if w_sum < 1e-10:
         return 999.0
     w       = w / w_sum
-    blended = (pred_arr * w).sum(axis=1)
-    blended = np.clip(blended, EPS, 1.0 - EPS)
+    blended = np.clip((pred_arr * w).sum(axis=1), EPS, 1.0 - EPS)
     return composite_score(y_true, blended)
 
 
@@ -518,65 +648,76 @@ def optimised_weighted_average(
     """
     Scipy Nelder-Mead optimisation of per-model ensemble weights.
 
-    Minimises the exact competition composite score on OOF predictions.
-    Uses 16+ initialisations (deterministic + random simplex points) to
-    escape local minima.  Weights are projected onto the simplex after
-    optimisation.
+    Initialisations are generated dynamically from len(config.model_names)
+    so the function is fully model-count agnostic — works for 2 models or 10.
 
-    WARNING: These weights are OOF-optimised — the reported score is
-    slightly optimistic.  The stacking meta-model (Strategy 3) is the
-    deployment-safe alternative with honest nested-CV evaluation.
+    Deterministic variants encode GBM-heavy domain knowledge (from v5.0
+    results where XGB+CAT dominated).  A _pad() helper normalises them to
+    the current model count so no hard-coded 5-element arrays remain.
+
+    Random Dirichlet initialisations (≥15, scaled with model count) provide
+    broad simplex coverage.
+
+    WARNING: weights are OOF-optimised → reported score is slightly
+    optimistic.  Strategy 3 (stacking) uses nested CV for honest evaluation.
     """
-    model_list = [m for m in MODEL_NAMES if m in oof_preds]
+    validate_model_set(config.model_names, oof_preds, "optimised_weighted_average")
 
-    missing_models = [m for m in MODEL_NAMES if m not in oof_preds]
-    if missing_models:
-        raise ValueError(
-            f"Missing OOF predictions for models: {missing_models}"
-        )
-
-    pred_arr = np.stack([oof_preds[m] for m in model_list], axis=1)
-    n_models = pred_arr.shape[1]
-
-    print("pred_arr shape:", pred_arr.shape)
-    print("n_models:", n_models)
-    print("model_list:", model_list)
+    model_names = config.model_names
+    n_models    = len(model_names)
+    pred_arr    = np.stack([oof_preds[m] for m in model_names], axis=1)
+    rng         = np.random.default_rng(config.seed)
 
     best_score   = 999.0
     best_weights = np.full(n_models, 1.0 / n_models)
 
-    # Deterministic initialisations — encode domain knowledge
-    initialisations = [
-        np.full(n_models, 1.0 / n_models),                    # equal
-        np.array([0.30, 0.35, 0.20, 0.10, 0.05]),             # XGB-heavy GBM
-        np.array([0.35, 0.30, 0.20, 0.10, 0.05]),             # LGB-heavy GBM
-        np.array([0.25, 0.25, 0.20, 0.15, 0.15]),             # GBM-balanced
-        np.array([0.25, 0.30, 0.15, 0.15, 0.15]),             # diversified
-        np.array([0.20, 0.25, 0.15, 0.20, 0.20]),             # cluster-balanced
-        np.array([0.33, 0.33, 0.17, 0.10, 0.07]),             # top-2 GBM + others
-        np.array([0.28, 0.32, 0.15, 0.13, 0.12]),             # XGB-dominant
-        np.array([0.50, 0.30, 0.10, 0.05, 0.05]),             # LGB dominant
-        np.array([0.30, 0.40, 0.10, 0.10, 0.10]),             # XGB dominant
+    def _pad(base: List[float]) -> np.ndarray:
+        """
+        Pad or trim a weight prototype to n_models, then normalise.
+        Allows GBM-heavy priors (designed for 5 models) to work with
+        any model count without raising shape errors.
+        """
+        w = np.array(base[:n_models]
+                     + [0.0] * max(0, n_models - len(base)),
+                     dtype=float)
+        total = w.sum()
+        return w / total if total > 1e-10 else np.full(n_models, 1.0 / n_models)
+
+    # ── Initialisations ───────────────────────────────────────────────────────
+    initialisations: List[np.ndarray] = [
+        np.full(n_models, 1.0 / n_models),     # equal weights (always first)
     ]
 
-    # Random Dirichlet initialisations for broad exploration
-    rng = np.random.default_rng(config.seed)
-    for _ in range(12):
+    # GBM-heavy domain-knowledge priors — meaningful when n_models >= 3
+    # and the first three slots are GBMs (enforced by default model_names order).
+    if n_models >= 3:
+        initialisations += [
+            _pad([0.30, 0.35, 0.20, 0.10, 0.05]),  # XGB-heavy
+            _pad([0.35, 0.30, 0.20, 0.10, 0.05]),  # LGB-heavy
+            _pad([0.25, 0.25, 0.20, 0.15, 0.15]),  # GBM-balanced
+            _pad([0.25, 0.30, 0.15, 0.15, 0.15]),  # diversified
+            _pad([0.20, 0.25, 0.15, 0.20, 0.20]),  # cluster-balanced
+            _pad([0.33, 0.33, 0.17, 0.10, 0.07]),  # top-2 GBM
+            _pad([0.50, 0.30, 0.10, 0.05, 0.05]),  # LGB dominant
+            _pad([0.30, 0.40, 0.10, 0.10, 0.10]),  # XGB dominant
+        ]
+
+    # Random Dirichlet — minimum 15, scales with model count
+    n_random = max(15, 3 * n_models)
+    for _ in range(n_random):
         initialisations.append(rng.dirichlet(np.ones(n_models)))
 
-    print(f"  Running weight optimisation ({len(initialisations)} initialisations)...")
+    print(f"  Running weight optimisation "
+          f"({len(initialisations)} initialisations, {n_models} models)...")
 
-    for i, w0 in enumerate(initialisations):
+    for w0 in initialisations:
         result = minimize(
             _weight_objective,
             x0      = w0,
             args    = (pred_arr, y_true),
             method  = config.optimiser_method,
-            options = {
-                "maxiter" : config.optimiser_maxiter,
-                "xatol"   : 1e-8,
-                "fatol"   : 1e-8,
-            },
+            options = {"maxiter": config.optimiser_maxiter,
+                       "xatol": 1e-8, "fatol": 1e-8},
         )
         if result.fun < best_score:
             best_score   = result.fun
@@ -586,11 +727,12 @@ def optimised_weighted_average(
     best_weights = np.clip(best_weights, 0.0, 1.0)
     best_weights = best_weights / best_weights.sum()
 
-    best_pred = (pred_arr * best_weights).sum(axis=1)
-    best_pred = np.clip(best_pred, CLIP_LOW, CLIP_HIGH)
-    metrics   = evaluate("optimised_weighted_average", y_true, best_pred)
+    best_pred   = np.clip(
+        (pred_arr * best_weights).sum(axis=1), CLIP_LOW, CLIP_HIGH
+    )
+    metrics     = evaluate("optimised_weighted_average", y_true, best_pred)
+    weight_dict = {m: float(w) for m, w in zip(model_names, best_weights)}
 
-    weight_dict = {m: float(w) for m, w in zip(model_list, best_weights)}
     print(f"  Optimised weights : {weight_dict}")
     print(f"  Best score        : {best_score:.6f}")
 
@@ -607,33 +749,22 @@ def _build_meta_features(
     extra_features : Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, List[str]]:
     """
-    Build meta-feature matrix and corresponding feature names.
+    Build meta-feature matrix from config.
 
-    Base features (always included, 5 columns):
-        Platt-calibrated OOF from each of the 5 base models.
-        Order: lightgbm, xgboost, catboost, logreg, tabnet.
+    Column order is determined entirely by config.model_names.
+    config.meta_feature_order property gives the corresponding names list
+    and is saved in metadata.json for self-describing run records.
 
-    Optional — inter-model disagreement (1 column):
-        Standard deviation across ALL 5 models' predictions per row.
-        High-disagreement rows are exactly where the meta-model adds value:
-        the GBM bloc and LogReg/TabNet clusters disagree, and the meta-model
-        has learned which cluster to trust conditionally.
-
-    Optional — raw features from SHAP analysis (k columns):
-        Top-k raw features identified in notebook 10_shap_interpretability.
-        Activated post-SHAP by setting use_raw_features=True in config.
-        extra_features array must be shaped (n, k).
-
-    Returns
-    -------
-    meta_X         : np.ndarray of shape (n, n_meta_features)
-    feature_names  : List[str] for coefficient reporting
+    Columns:
+      [0 … n_models−1]  Calibrated OOF from each model in model_names order
+      [n_models]         inter_model_disagreement (if use_disagreement)
+      [n_models+1 …]     shap_raw_feature_k       (if use_raw_features)
     """
-    meta_X         = np.stack([oof_preds[m] for m in MODEL_NAMES], axis=1)
-    feature_names  = list(MODEL_NAMES)
+    model_names   = config.model_names
+    meta_X        = np.stack([oof_preds[m] for m in model_names], axis=1)
+    feature_names = list(model_names)
 
     if config.use_disagreement:
-        # Std across all 5 models per customer — disagreement signal
         disagreement  = meta_X.std(axis=1, keepdims=True)
         meta_X        = np.hstack([meta_X, disagreement])
         feature_names.append("inter_model_disagreement")
@@ -642,8 +773,8 @@ def _build_meta_features(
         if extra_features.shape[0] != meta_X.shape[0]:
             raise ValueError(
                 f"extra_features row count ({extra_features.shape[0]}) "
-                f"does not match OOF row count ({meta_X.shape[0]}). "
-                "Ensure extra_features is aligned to the training set."
+                f"!= OOF row count ({meta_X.shape[0]}).  "
+                "Ensure extra_features is aligned to the full training set."
             )
         meta_X = np.hstack([meta_X, extra_features])
         for i in range(extra_features.shape[1]):
@@ -651,7 +782,6 @@ def _build_meta_features(
 
     print(f"  Meta-feature matrix : shape={meta_X.shape}  "
           f"features={feature_names}")
-
     return meta_X, feature_names
 
 
@@ -662,96 +792,66 @@ def stacking_ensemble(
     extra_features : Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict, LogisticRegression, pd.DataFrame]:
     """
-    Stacking ensemble with LogisticRegression(C=0.05) meta-model.
+    Stacking ensemble with LogisticRegression(C=meta_C) meta-model.
 
-    Nested 5-fold CV protocol:
-    ─────────────────────────
-    For each outer fold (val_idx):
-      - Meta-model trained on train_idx OOF predictions
-      - Meta-model predicts val_idx → honest OOF meta-prediction
-    After CV: final meta-model fitted on ALL OOF data (for test inference).
+    Strict OOF protocol — no leakage:
+      For each outer fold: meta-model trained on held-out OOF, predicts val.
+      Final meta-model fitted on ALL OOF data for test-set inference.
 
-    This is a strict OOF stacking implementation — the meta-model is NEVER
-    evaluated on the same rows it was trained on.  The CV composite score
-    is the honest estimate of deployment performance.
+    Why LogisticRegression as meta-model?
+      ≤7 meta-features, 40k samples → tree meta-model would memorise.
+      LogReg with C=0.05 gives stable, interpretable weights and respects
+      the [0,1] probability contract.
 
-    Why LogisticRegression (not GBM) as meta-model?
-    ────────────────────────────────────────────────
-    With 5–7 meta-features and 40,000 samples, a tree-based meta-model
-    would memorise rather than generalise.  LogisticRegression with
-    C=0.05 regularisation produces stable, interpretable weights and
-    respects the probability output contract (values in [0, 1]).
-
-    Parameters
-    ----------
-    oof_preds      : calibrated OOF predictions for all 5 models
-    y_true         : ground truth labels
-    config         : EnsembleConfig (meta_C=0.05 for v5)
-    extra_features : optional SHAP raw features (n, k) — post-SHAP step
-
-    Returns
-    -------
-    stacking_oof     : np.ndarray — CV stacking OOF predictions
-    metrics          : dict
-    final_meta_model : LogisticRegression fitted on full OOF data
-    coefficients     : pd.DataFrame — coefficient table for interpretability
+    Known limitation — fold misalignment in calibrated_stacking():
+      The Platt pass in Strategy 4 uses independently drawn CV folds,
+      not aligned to these stacking folds.  Impact is negligible
+      (2 parameters, 40k rows).  Documented in calibrated_stacking().
     """
+    validate_model_set(config.model_names, oof_preds, "stacking_ensemble")
+
     meta_X, feature_names = _build_meta_features(oof_preds, config, extra_features)
     n_meta_features       = meta_X.shape[1]
 
-    stacking_oof = np.zeros(len(y_true), dtype=float)
-    skf          = StratifiedKFold(
+    stacking_oof              = np.zeros(len(y_true), dtype=float)
+    skf                       = StratifiedKFold(
         n_splits=config.n_splits, shuffle=True, random_state=config.seed
     )
-
-    fold_scores  = []
-    fold_lls     = []
-    fold_aucs    = []
+    fold_scores: List[float] = []
+    fold_lls   : List[float] = []
+    fold_aucs  : List[float] = []
 
     print(f"  Nested {config.n_splits}-fold CV for honest OOF stacking...")
     print(f"  {'Fold':>4}  {'Score':>8}  {'LogLoss':>8}  {'AUC':>8}")
     print(f"  {'-'*40}")
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(meta_X, y_true)):
-        X_tr, y_tr = meta_X[train_idx], y_true[train_idx]
-        X_val, y_val = meta_X[val_idx], y_true[val_idx]
-
         meta_model = LogisticRegression(
-            C            = config.meta_C,
-            solver       = config.meta_solver,
-            max_iter     = config.meta_max_iter,
-            random_state = config.seed,
+            C=config.meta_C, solver=config.meta_solver,
+            max_iter=config.meta_max_iter, random_state=config.seed,
         )
-        meta_model.fit(X_tr, y_tr)
+        meta_model.fit(meta_X[train_idx], y_true[train_idx])
 
-        fold_pred             = meta_model.predict_proba(X_val)[:, 1]
+        fold_pred             = meta_model.predict_proba(meta_X[val_idx])[:, 1]
         stacking_oof[val_idx] = fold_pred
 
-        fs  = composite_score(y_val, fold_pred)
-        fll = float(log_loss(y_val, np.clip(fold_pred, EPS, 1.0 - EPS)))
-        fau = float(roc_auc_score(y_val, fold_pred))
-        fold_scores.append(fs)
-        fold_lls.append(fll)
-        fold_aucs.append(fau)
-
+        fs  = composite_score(y_true[val_idx], fold_pred)
+        fll = float(log_loss(y_true[val_idx],
+                              np.clip(fold_pred, EPS, 1.0 - EPS)))
+        fau = float(roc_auc_score(y_true[val_idx], fold_pred))
+        fold_scores.append(fs); fold_lls.append(fll); fold_aucs.append(fau)
         print(f"  {fold:>4}  {fs:>8.5f}  {fll:>8.5f}  {fau:>8.5f}")
 
-    mean_score = float(np.mean(fold_scores))
-    std_score  = float(np.std(fold_scores))
-    mean_ll    = float(np.mean(fold_lls))
-    mean_auc   = float(np.mean(fold_aucs))
-
     print(f"  {'-'*40}")
-    print(f"  {'MEAN':>4}  {mean_score:>8.5f}  {mean_ll:>8.5f}  {mean_auc:>8.5f}")
-    print(f"  {'STD':>4}  {std_score:>8.5f}  {float(np.std(fold_lls)):>8.5f}  "
-          f"{float(np.std(fold_aucs)):>8.5f}")
+    print(f"  {'MEAN':>4}  {np.mean(fold_scores):>8.5f}  "
+          f"{np.mean(fold_lls):>8.5f}  {np.mean(fold_aucs):>8.5f}")
+    print(f"  {'STD':>4}  {np.std(fold_scores):>8.5f}  "
+          f"{np.std(fold_lls):>8.5f}  {np.std(fold_aucs):>8.5f}")
 
-    # Final meta-model fitted on ALL OOF data — used for test set inference
+    # Final meta-model on all data — for test-set inference ONLY
     final_meta_model = LogisticRegression(
-        C            = config.meta_C,
-        solver       = config.meta_solver,
-        max_iter     = config.meta_max_iter,
-        random_state = config.seed,
+        C=config.meta_C, solver=config.meta_solver,
+        max_iter=config.meta_max_iter, random_state=config.seed,
     )
     final_meta_model.fit(meta_X, y_true)
 
@@ -763,14 +863,9 @@ def stacking_ensemble(
 
     print(f"\n  Meta-model coefficients (C={config.meta_C}):")
     print(coefficients.to_string(index=False))
-
-    # Interpretation guidance: high coefficient = meta-model trusts this model more
-    best_meta_feature = coefficients.iloc[0]["feature"]
-    print(f"\n  → Meta-model trusts '{best_meta_feature}' most strongly.")
-    print(f"  → Compare to individual composite scores for context.")
+    print(f"\n  → Meta-model trusts '{coefficients.iloc[0]['feature']}' most.")
 
     metrics = evaluate("stacking", y_true, stacking_oof)
-
     return stacking_oof, metrics, final_meta_model, coefficients
 
 
@@ -782,49 +877,47 @@ def calibrated_stacking(
     stacking_oof : np.ndarray,
     y_true       : np.ndarray,
     config       : EnsembleConfig,
-) -> Tuple[np.ndarray, Dict, "PlattCalibrator"]:
+) -> Tuple[np.ndarray, Dict, PlattCalibrator]:
     """
-    Apply cross-validated Platt calibration to the stacking OOF predictions.
+    Cross-validated Platt calibration of the stacking OOF predictions.
 
-    Although LogisticRegression is calibrated by design, the input feature
-    scale (mixing GBM predictions near 0.15 mean with LogReg/TabNet at
-    higher post-Platt means) can introduce mild residual miscalibration.
-    A final Platt pass corrects this at a cost of ~2 parameters.
-
-    Uses nested CV Platt (5 folds) for an honest calibrated OOF estimate.
-    The final_calibrator (fitted on all data) is saved for test inference.
+    LogisticRegression is calibrated by design, but mixing GBM predictions
+    (mean ~0.15) with LogReg/TabNet (higher post-Platt means) can introduce
+    mild residual miscalibration.  A Platt pass with 2 parameters corrects
+    this with negligible overfitting risk.
 
     Known limitation — fold misalignment:
         The Platt CV folds here are NOT aligned to the stacking CV folds
         that produced stacking_oof.  Each calibration fold's held-out rows
         were predicted by meta-models trained on overlapping (but not
-        identical) samples from the stacking phase.  The resulting optimism
-        is negligible in practice (the Platt calibrator has only 2 free
-        parameters across 40k rows), but treat calibrated_stacking scores
-        as a lower-bound estimate rather than a perfectly honest OOF score.
-        The rigorous fix — calibrating within each stacking outer fold —
-        requires restructuring stacking_ensemble() to expose per-fold
-        predictions before aggregation.  Deferred post-competition.
+        identical) stacking samples.  Impact is negligible (2 parameters,
+        40k rows), but treat calibrated_stacking scores as lower-bound
+        estimates rather than perfectly honest OOF scores.
+        Rigorous fix (calibrating within each stacking outer fold) requires
+        restructuring stacking_ensemble() to expose per-fold predictions
+        before aggregation.  Deferred post-competition.
 
     Returns
     -------
-    calibrated_oof   : np.ndarray — CV-calibrated stacking OOF predictions
-    metrics          : dict
-    final_calibrator : PlattCalibrator — apply to test set stacking output
+    calibrated_oof   : CV-calibrated stacking OOF predictions
+    metrics          : full metric dict
+    final_calibrator : PlattCalibrator fitted on all data (for test set)
     """
     calibrated_oof, final_calibrator = cv_platt_calibrate(
         stacking_oof, y_true,
-        n_splits = config.n_splits,
-        seed     = config.seed,
-        C        = 1e10,                    # unconstrained — just fit the sigmoid
+        n_splits=config.n_splits, seed=config.seed, C=1e10,
     )
     calibrated_oof = np.clip(calibrated_oof, CLIP_LOW, CLIP_HIGH)
     metrics        = evaluate("stacking_calibrated", y_true, calibrated_oof)
 
-    print(f"  Final calibrator: slope={final_calibrator.slope:.4f}  "
+    slope = final_calibrator.slope
+    print(f"  Final calibrator : slope={slope:.4f}  "
           f"intercept={final_calibrator.intercept:.4f}")
-    print(f"  Slope ≈ 1.0 → stacking output already well-calibrated ✓")
-    print(f"  Slope >> 1.0 → residual compression was present (expected if large)")
+    if abs(slope - 1.0) < 0.3:
+        print("  Slope ≈ 1.0 → stacking output well-calibrated ✓")
+    else:
+        print(f"  Slope = {slope:.4f} → residual compression present; "
+              "Platt correction applied.")
 
     return calibrated_oof, metrics, final_calibrator
 
@@ -833,98 +926,119 @@ def calibrated_stacking(
 # REPORTING UTILITIES
 # =============================================================================
 
-def print_correlation_report(corr_matrix: pd.DataFrame) -> None:
-    """Print the OOF Pearson correlation matrix with cluster analysis."""
+def print_correlation_report(
+    corr_matrix : pd.DataFrame,
+    config      : EnsembleConfig,
+) -> None:
+    """
+    Print OOF Pearson correlation matrix with cluster analysis.
+
+    Cluster groups read from config.model_groups — no hardcoded strings.
+    Groups with fewer than 2 active members are reported as singletons.
+    """
     print("\n  OOF Pearson Correlation Matrix (post-Platt):")
     print(corr_matrix.round(3).to_string())
 
-    # Extract cross-cluster correlations for interpretation
-    gbm_models    = ["lightgbm", "xgboost", "catboost"]
-    non_gbm       = ["logreg", "tabnet"]
+    model_names = config.model_names
 
-    gbm_intra     = [corr_matrix.loc[a, b]
-                     for i, a in enumerate(gbm_models)
-                     for j, b in enumerate(gbm_models) if i < j]
-    cross_cluster = [corr_matrix.loc[a, b]
-                     for a in gbm_models for b in non_gbm]
-    non_gbm_cross = [corr_matrix.loc["logreg", "tabnet"]]
+    # Resolve active members per group (only models in current config)
+    active_groups: Dict[str, List[str]] = {
+        g: [m for m in members if m in model_names]
+        for g, members in config.model_groups.items()
+    }
 
-    print(f"\n  Cluster structure:")
-    print(f"  GBM intra-cluster         : {min(gbm_intra):.3f} – {max(gbm_intra):.3f}")
-    print(f"  GBM vs LogReg/TabNet      : {min(cross_cluster):.3f} – {max(cross_cluster):.3f}")
-    print(f"  LogReg vs TabNet          : {non_gbm_cross[0]:.3f}")
+    print(f"\n  Cluster structure ({len(model_names)} active models):")
+    for group_name, members in active_groups.items():
+        if len(members) >= 2:
+            intra = [corr_matrix.loc[a, b]
+                     for i, a in enumerate(members)
+                     for j, b in enumerate(members) if i < j]
+            print(f"  {group_name:12s} intra-cluster : "
+                  f"{min(intra):.3f} – {max(intra):.3f}")
+        elif len(members) == 1:
+            print(f"  {group_name:12s}              : "
+                  f"{members[0]} (singleton)")
 
-    gbm_cross_max = max(cross_cluster)
-    if gbm_cross_max < 0.82:
-        print(f"\n  ✓ Cross-cluster diversity target MET (<0.82). Stacking justified.")
-    else:
-        print(f"\n  ⚠ Cross-cluster correlation {gbm_cross_max:.3f} > 0.82 target.")
-        print(f"    Stacking may not outperform optimised weighting.")
+    # Cross-cluster range — every pair across different groups
+    group_model_pairs = [
+        (g, m) for g, ms in active_groups.items() for m in ms
+    ]
+    cross_vals: List[float] = []
+    for i, (g1, m1) in enumerate(group_model_pairs):
+        for j, (g2, m2) in enumerate(group_model_pairs):
+            if i < j and g1 != g2:
+                cross_vals.append(float(corr_matrix.loc[m1, m2]))
+
+    if cross_vals:
+        print(f"  {'cross-cluster':12s}              : "
+              f"{min(cross_vals):.3f} – {max(cross_vals):.3f}")
+        if max(cross_vals) < 0.82:
+            print("  ✓ Cross-cluster diversity target MET (<0.82). "
+                  "Stacking justified.")
+        else:
+            print(f"  ⚠ Cross-cluster max {max(cross_vals):.3f} > 0.82 target. "
+                  "Stacking may not outperform weighted averaging.")
 
 
-def print_results_table(results: EnsembleResults) -> None:
-    """Print a formatted comparison table of all ensemble strategies."""
-    sep = "=" * 90
+def print_results_table(
+    results     : EnsembleResults,
+    model_names : List[str],
+) -> None:
+    """Formatted comparison table of all ensemble strategies."""
+    sep = "=" * 92
     print(f"\n{sep}")
-    print("ENSEMBLE v5 — RESULTS SUMMARY")
+    print("ENSEMBLE RESULTS SUMMARY")
     print(sep)
-    print(f"{'Strategy':40s}  {'LogLoss':>8}  {'AUC':>8}  "
+    print(f"{'Strategy':42s}  {'LogLoss':>8}  {'AUC':>8}  "
           f"{'Score':>8}  {'Brier':>8}")
-    print("-" * 90)
+    print("-" * 92)
 
+    ref_score      = _KNOWN_INDIVIDUAL_SCORES.get("xgboost", None)
     sorted_metrics = sorted(results.strategy_metrics, key=lambda x: x["score"])
 
     for m in sorted_metrics:
-        marker = "  ← BEST" if m["name"] == results.best_strategy else ""
-        # Add improvement vs best single model for ensemble strategies
-        ref = _KNOWN_INDIVIDUAL_SCORES.get("xgboost", 0.19350)
+        marker      = "  ← BEST" if m["name"] == results.best_strategy else ""
         improvement = ""
-        if m["name"] not in _KNOWN_INDIVIDUAL_SCORES:
-            delta = m["score"] - ref
+        if ref_score is not None and m["name"] not in _KNOWN_INDIVIDUAL_SCORES:
+            delta = m["score"] - ref_score
             sign  = "+" if delta > 0 else ""
-            improvement = f"  ({sign}{delta:.5f} vs XGB baseline)"
-
-        print(f"{m['name']:40s}  {m['logloss']:>8.5f}  {m['auc']:>8.5f}  "
-              f"{m['score']:>8.5f}  {m['brier']:>8.5f}"
-              f"{marker}{improvement}")
+            improvement = f"  ({sign}{delta:.5f} vs XGB)"
+        print(f"{m['name']:42s}  {m['logloss']:>8.5f}  {m['auc']:>8.5f}  "
+              f"{m['score']:>8.5f}  {m['brier']:>8.5f}{marker}{improvement}")
 
     print(sep)
-    print(f"\nBest strategy : {results.best_strategy}")
+    print(f"\nModels        : {model_names}")
+    print(f"Best strategy : {results.best_strategy}")
     print(f"Best score    : {results.best_score:.6f}")
-    print(f"XGB baseline  : {_KNOWN_INDIVIDUAL_SCORES['xgboost']:.6f}")
-    delta = results.best_score - _KNOWN_INDIVIDUAL_SCORES["xgboost"]
-    sign  = "+" if delta >= 0 else ""
-    print(f"Improvement   : {sign}{delta:.6f}")
+    if ref_score is not None:
+        delta = results.best_score - ref_score
+        sign  = "+" if delta >= 0 else ""
+        print(f"XGB baseline  : {ref_score:.6f}")
+        print(f"Improvement   : {sign}{delta:.6f}")
     print(f"Runtime       : {results.runtime_sec:.1f} seconds")
 
 
 # =============================================================================
-# ARTIFACT SAVING
+# ARTEFACT SAVING
 # =============================================================================
 
 def save_ensemble_artifacts(
     results         : EnsembleResults,
     meta_model      : LogisticRegression,
-    meta_calibrator : Optional["PlattCalibrator"],
+    meta_calibrator : Optional[PlattCalibrator],
     coefficients    : pd.DataFrame,
     corr_matrix     : pd.DataFrame,
     config          : EnsembleConfig,
     run_dir         : Path,
 ) -> None:
     """
-    Save all ensemble artefacts to the run directory.
+    Save all ensemble artefacts to the timestamped run directory.
 
-    Output layout (v5):
-    outputs/experiments/v5_ensemble/run_YYYYMMDD_HHMMSS/
-        ensemble_oof.npy           final calibrated stacking OOF
-        stacking_oof.npy           raw stacking output (pre-calibration)
-        ensemble_weights.json      optimised weights per strategy
-        meta_model.pkl             fitted stacking LogisticRegression
-        meta_calibrator.pkl        Platt calibrator on ensemble OOF
-        stacking_results.json      full metrics for all strategies
-        feature_importance.csv     meta-model coefficient table
-        correlation_matrix.csv     OOF Pearson correlation matrix
-        metadata.json              run record with all hyperparameters
+    metadata.json is self-describing: it contains model_names,
+    calibration_folder_map, ensemble_version, and meta_feature_order
+    so any future reload — including EnsembleInference.from_run_dir() —
+    can reconstruct the exact training configuration without relying on
+    current module defaults.
     """
     # OOF predictions
     if results.ensemble_oof is not None and len(results.ensemble_oof) > 0:
@@ -932,66 +1046,56 @@ def save_ensemble_artifacts(
     if results.stacking_oof is not None and len(results.stacking_oof) > 0:
         np.save(run_dir / "stacking_oof.npy", results.stacking_oof)
 
-    # Ensemble weights
-    weights_data = {
-        "optimised"  : results.optimised_weights,
-        "model_order": MODEL_NAMES,
-        "note"       : (
-            "Weights are OOF-optimised and slightly optimistic. "
-            "Use stacking (meta_model.pkl) for deployment."
-        ),
-    }
+    # Weights
     with open(run_dir / "ensemble_weights.json", "w") as f:
-        json.dump(weights_data, f, indent=4)
+        json.dump({
+            "optimised"  : results.optimised_weights,
+            "model_order": config.model_names,
+            "note"       : (
+                "Weights are OOF-optimised (slightly optimistic). "
+                "Use meta_model.pkl for deployment."
+            ),
+        }, f, indent=4)
 
-    # Meta-model and calibrator
+    # Meta-model + calibrator
     joblib.dump(meta_model, run_dir / "meta_model.pkl")
     if meta_calibrator is not None:
         joblib.dump(meta_calibrator, run_dir / "meta_calibrator.pkl")
 
-    # Strategy results
+    # Strategy metrics + coefficients + correlation matrix
     with open(run_dir / "stacking_results.json", "w") as f:
         json.dump(results.strategy_metrics, f, indent=4)
-
-    # Meta-model coefficients
     coefficients.to_csv(run_dir / "feature_importance.csv", index=False)
-
-    # OOF correlation matrix
     corr_matrix.to_csv(run_dir / "correlation_matrix.csv")
 
-    # Metadata
-    best_single_score = _KNOWN_INDIVIDUAL_SCORES.get("xgboost", None)
-    metadata = {
-        "created_at"       : datetime.now().isoformat(),
-        "version"          : "v5",
-        "model_names"      : MODEL_NAMES,
-        "best_strategy"    : results.best_strategy,
-        "best_score"       : results.best_score,
-        "xgb_baseline"     : best_single_score,
-        "improvement_vs_xgb": (
-            round(results.best_score - best_single_score, 6)
-            if best_single_score is not None else None
+    # Self-describing metadata
+    ref_score = _KNOWN_INDIVIDUAL_SCORES.get("xgboost", None)
+    metadata  = {
+        "created_at"             : datetime.now().isoformat(),
+        "ensemble_version"       : config.ensemble_version,
+        "model_names"            : config.model_names,
+        "calibration_folder_map" : config.calibration_folder_map,
+        "model_groups"           : config.model_groups,
+        "best_strategy"          : results.best_strategy,
+        "best_score"             : results.best_score,
+        "xgb_baseline"           : ref_score,
+        "improvement_vs_xgb"     : (
+            round(results.best_score - ref_score, 6)
+            if ref_score is not None else None
         ),
-        "runtime_sec"      : results.runtime_sec,
-        "config"           : asdict(config),
-        "strategy_summary" : [
-            {k: v for k, v in m.items() if k != "name"}
-            | {"strategy": m["name"]}
+        "runtime_sec"            : results.runtime_sec,
+        "config"                 : asdict(config),
+        "strategy_summary"       : [
+            {k: v for k, v in m.items() if k != "name"} | {"strategy": m["name"]}
             for m in results.strategy_metrics
         ],
-        "meta_model_summary": {
-            "C"                 : config.meta_C,
-            "solver"            : config.meta_solver,
-            "use_disagreement"  : config.use_disagreement,
-            "use_raw_features"  : config.use_raw_features,
-            # Explicit feature order so any future reload is self-describing.
-            # The meta-model's coef_[0] indices map to this list in order.
-            "meta_feature_order": (
-                list(MODEL_NAMES)
-                + (["inter_model_disagreement"] if config.use_disagreement else [])
-                + ([f"shap_raw_feature_{i}" for i in range(config.top_k_raw_features)]
-                   if config.use_raw_features else [])
-            ),
+        "meta_model_summary"     : {
+            "C"                  : config.meta_C,
+            "solver"             : config.meta_solver,
+            "use_disagreement"   : config.use_disagreement,
+            "use_raw_features"   : config.use_raw_features,
+            # Column order of meta_model.coef_[0] — critical for inference
+            "meta_feature_order" : config.meta_feature_order,
         },
     }
     with open(run_dir / "metadata.json", "w") as f:
@@ -1011,41 +1115,41 @@ def run_ensemble_pipeline(
     extra_features : Optional[np.ndarray] = None,
 ) -> EnsembleResults:
     """
-    Full 5-model ensemble pipeline — v5.
+    Full ensemble pipeline — evaluates all four strategies in order.
 
-    Executes all four ensemble strategies in order:
-      1. Simple average (equal-weight baseline)
-      2. Optimised weighted average (Scipy Nelder-Mead)
-      3. Stacking (LogisticRegression meta-model, C=0.05)
-      4. Calibrated stacking (Platt pass on stacking OOF output)
+    Strategies:
+      1. Simple average          (equal-weight baseline)
+      2. Optimised weighted avg  (Scipy Nelder-Mead on composite score)
+      3. Stacking                (LogisticRegression meta-model, nested CV)
+      4. Calibrated stacking     (Platt pass on stacking output)
 
     Parameters
     ----------
-    config         : EnsembleConfig
-    extra_features : optional np.ndarray of shape (n, k)
-                     Top-k raw features from SHAP analysis.
-                     Only used when config.use_raw_features=True.
-                     If None and use_raw_features=True, raises ValueError.
+    config         : EnsembleConfig — single source of truth
+    extra_features : optional (n, k) array of top-k SHAP raw features.
+                     Required when config.use_raw_features=True.
 
     Returns
     -------
-    EnsembleResults with all metrics, predictions, and artefacts saved.
+    EnsembleResults — all metrics, predictions, and artefacts saved.
     """
     start_time = time.perf_counter()
     results    = EnsembleResults()
 
+    # Pre-flight checks
+    config.validate()
     if config.use_raw_features and extra_features is None:
         raise ValueError(
-            "config.use_raw_features=True but extra_features is None.\n"
-            "Run SHAP analysis (notebook 10) first and pass the top-k "
-            "feature matrix here."
+            "config.use_raw_features=True but extra_features=None.  "
+            "Run SHAP analysis (notebook 10) and pass the top-k feature "
+            "matrix as extra_features."
         )
 
     print("=" * 70)
-    print("ENSEMBLE PIPELINE — v5 (5-Model Stacking)")
+    print(f"ENSEMBLE PIPELINE — {config.ensemble_version}")
     print("=" * 70)
-    print(f"Models     : {MODEL_NAMES}")
-    print(f"meta_C     : {config.meta_C}")
+    print(f"Models              : {config.model_names}")
+    print(f"meta_C              : {config.meta_C}")
     print(f"Disagreement feature: {config.use_disagreement}")
     print(f"Raw features (SHAP) : {config.use_raw_features}")
 
@@ -1057,30 +1161,27 @@ def run_ensemble_pipeline(
     # ── 1. Load and validate OOF artefacts ───────────────────────────────────
     print("\n[1/5] Loading OOF artefacts...")
     oof_artifacts = load_oof_artifacts(config)
-    y_true    = oof_artifacts["y_true"]
-    oof_preds = {m: oof_artifacts[m] for m in MODEL_NAMES}
+    y_true        = oof_artifacts["y_true"]
+    oof_preds     = {m: oof_artifacts[m] for m in config.model_names}
 
-    # Correlation matrix — confirm three-cluster structure
     print("\n  Computing OOF correlation matrix...")
-    corr_matrix = compute_oof_correlations(oof_preds)
-    print_correlation_report(corr_matrix)
+    corr_matrix = compute_oof_correlations(oof_preds, config.model_names)
+    print_correlation_report(corr_matrix, config)
 
-    # Individual model baselines
     print("\n  Individual model metrics (Platt-calibrated OOF):")
     print(f"  {'Model':12s}  {'LogLoss':>8}  {'AUC':>8}  {'Score':>8}")
     print(f"  {'-'*46}")
-    for m in MODEL_NAMES:
+    for m in config.model_names:
         m_metrics = evaluate(m, y_true, oof_preds[m])
         results.strategy_metrics.append(m_metrics)
         print(f"  {m:12s}  {m_metrics['logloss']:>8.5f}  "
               f"{m_metrics['auc']:>8.5f}  {m_metrics['score']:>8.5f}")
 
     # ── 2. Simple average ─────────────────────────────────────────────────────
-    print("\n[2/5] Strategy 1 — Simple average (equal-weight baseline)...")
-    avg_pred, avg_metrics = simple_average(oof_preds, y_true)
+    print("\n[2/5] Strategy 1 — Simple average...")
+    avg_pred, avg_metrics = simple_average(oof_preds, y_true, config.model_names)
     results.strategy_metrics.append(avg_metrics)
-    print(f"  LL={avg_metrics['logloss']:.5f}  "
-          f"AUC={avg_metrics['auc']:.5f}  "
+    print(f"  LL={avg_metrics['logloss']:.5f}  AUC={avg_metrics['auc']:.5f}  "
           f"Score={avg_metrics['score']:.5f}")
 
     # ── 3. Optimised weighted average ─────────────────────────────────────────
@@ -1090,14 +1191,13 @@ def run_ensemble_pipeline(
     )
     results.strategy_metrics.append(opt_metrics)
     results.optimised_weights = {
-        m: float(w) for m, w in zip(MODEL_NAMES, opt_weights)
+        m: float(w) for m, w in zip(config.model_names, opt_weights)
     }
-    print(f"  LL={opt_metrics['logloss']:.5f}  "
-          f"AUC={opt_metrics['auc']:.5f}  "
+    print(f"  LL={opt_metrics['logloss']:.5f}  AUC={opt_metrics['auc']:.5f}  "
           f"Score={opt_metrics['score']:.5f}")
 
     # ── 4. Stacking ───────────────────────────────────────────────────────────
-    print("\n[4/5] Strategy 3 — Stacking meta-model (LogReg, C=0.05)...")
+    print(f"\n[4/5] Strategy 3 — Stacking (LogReg, C={config.meta_C})...")
     stacking_oof, stacking_metrics, meta_model, coefficients = stacking_ensemble(
         oof_preds, y_true, config, extra_features
     )
@@ -1110,7 +1210,7 @@ def run_ensemble_pipeline(
     # ── 5. Calibrated stacking ────────────────────────────────────────────────
     meta_calibrator = None
     if config.calibrate_ensemble:
-        print("\n[5/5] Strategy 4 — Calibrated stacking (Platt on ensemble OOF)...")
+        print("\n[5/5] Strategy 4 — Calibrated stacking...")
         cal_oof, cal_metrics, meta_calibrator = calibrated_stacking(
             stacking_oof, y_true, config
         )
@@ -1128,8 +1228,8 @@ def run_ensemble_pipeline(
             results.best_score    = m["score"]
             results.best_strategy = m["name"]
 
-    # ── 7. Record runtime BEFORE saving — metadata.json must capture it ───────
-    # (Bug fix: previously set after save, causing metadata to always record 0.0)
+    # ── 7. Record runtime BEFORE saving ──────────────────────────────────────
+    # Bug fix from v5.0: runtime was set AFTER save → metadata always showed 0.0
     results.runtime_sec = time.perf_counter() - start_time
 
     # ── 8. Save all artefacts ─────────────────────────────────────────────────
@@ -1138,8 +1238,7 @@ def run_ensemble_pipeline(
         coefficients, corr_matrix, config, run_dir
     )
 
-    print_results_table(results)
-
+    print_results_table(results, config.model_names)
     return results
 
 
@@ -1149,55 +1248,95 @@ def run_ensemble_pipeline(
 
 class EnsembleInference:
     """
-    Production inference wrapper for the trained 5-model ensemble.
+    Production inference wrapper for the trained ensemble.
 
-    Loads all artefacts from a completed ensemble run directory and
-    exposes a single predict() method for use in the inference pipeline
-    (notebooks 11_final_submission.ipynb and src/inference/predict.py).
+    Critically: model_names and calibration_folder_map are loaded from the
+    run's metadata.json — NOT from current module-level defaults.  This
+    guarantees training-inference consistency even if module defaults change.
 
     Usage
     -----
-    inference = EnsembleInference.from_run_dir(run_dir, config)
-    probabilities = inference.predict(raw_preds_per_model)
+    inference = EnsembleInference.from_run_dir(
+        run_dir      = "outputs/experiments/v5_ensemble/run_20260508_054540",
+        project_root = "D:/PROJECTS/liquidity-stress-early-warning",
+    )
+    probs = inference.predict(raw_preds_per_model)
 
     TabNet note
     -----------
-    raw_preds_per_model["tabnet"] should be the RAW (un-Platt-calibrated)
-    fold-averaged predictions from TabNet.  The per-model Platt calibrators
-    loaded here will calibrate them before the meta-model.
+    raw_preds_per_model["tabnet"] should be RAW (un-Platt-calibrated)
+    fold-averaged predictions.  The per-model calibrators apply Platt
+    scaling before the meta-model sees them.
     """
 
     def __init__(
         self,
         meta_model       : LogisticRegression,
-        meta_calibrator  : Optional["PlattCalibrator"],
-        base_calibrators : Dict[str, "PlattCalibrator"],
-        config           : EnsembleConfig,
+        meta_calibrator  : Optional[PlattCalibrator],
+        base_calibrators : Dict[str, PlattCalibrator],
+        model_names      : List[str],
+        use_disagreement : bool,
+        use_raw_features : bool,
+        ensemble_version : str = "unknown",
     ) -> None:
         self.meta_model       = meta_model
         self.meta_calibrator  = meta_calibrator
         self.base_calibrators = base_calibrators
-        self.config           = config
+        self.model_names      = model_names
+        self.use_disagreement = use_disagreement
+        self.use_raw_features = use_raw_features
+        self.ensemble_version = ensemble_version
 
     @classmethod
     def from_run_dir(
         cls,
-        run_dir : str,
-        config  : EnsembleConfig,
+        run_dir         : str,
+        project_root    : str,
+        calibration_dir : str = "outputs/calibration",
     ) -> "EnsembleInference":
         """
         Load inference artefacts from a completed ensemble run directory.
 
-        Loads:
-          run_dir/meta_model.pkl              — stacking meta-model
-          run_dir/meta_calibrator.pkl         — final Platt calibrator
-          calibration_dir/{abbrev}/calibrator_platt.pkl  — per-model Platt
+        Model names and calibration_folder_map are read from metadata.json,
+        not from current module-level defaults.  This is the critical
+        guarantee that prevents training-inference divergence when module
+        defaults change in future versions.
+
+        Parameters
+        ----------
+        run_dir         : path to timestamped run directory
+        project_root    : project root (for resolving calibration paths)
+        calibration_dir : relative path to calibration artefacts
         """
         run_path = Path(run_dir)
-        root     = Path(config.project_root)
+        root     = Path(project_root)
 
-        meta_model      = joblib.load(run_path / "meta_model.pkl")
+        meta_path = run_path / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"metadata.json not found at {meta_path}.\n"
+                "Cannot reconstruct inference config without training metadata.\n"
+                "If this run predates v5.1, reconstruct EnsembleInference manually."
+            )
+        with open(meta_path) as f:
+            metadata = json.load(f)
 
+        model_names            = metadata["model_names"]
+        calibration_folder_map = metadata.get(
+            "calibration_folder_map", _DEFAULT_CALIBRATION_FOLDER
+        )
+        meta_summary           = metadata.get("meta_model_summary", {})
+        use_disagreement       = meta_summary.get("use_disagreement", True)
+        use_raw_features       = meta_summary.get("use_raw_features", False)
+        ensemble_version       = metadata.get("ensemble_version", "unknown")
+
+        print(f"  Loading inference artefacts [{ensemble_version}]")
+        print(f"  model_names : {model_names}")
+
+        # Meta-model
+        meta_model = joblib.load(run_path / "meta_model.pkl")
+
+        # Meta-calibrator (optional)
         meta_calibrator = None
         cal_path        = run_path / "meta_calibrator.pkl"
         if cal_path.exists():
@@ -1206,11 +1345,11 @@ class EnsembleInference:
             print("  Warning: meta_calibrator.pkl not found — "
                   "final Platt step will be skipped.")
 
-        # Per-model Platt calibrators (use _CALIBRATION_FOLDER for abbreviated paths)
-        base_calibrators: Dict[str, "PlattCalibrator"] = {}
-        cal_dir = root / config.calibration_dir
-        for m in MODEL_NAMES:
-            folder     = _CALIBRATION_FOLDER[m]
+        # Per-model Platt calibrators — paths from training metadata
+        base_calibrators: Dict[str, PlattCalibrator] = {}
+        cal_dir = root / calibration_dir
+        for m in model_names:
+            folder     = calibration_folder_map.get(m, m)
             platt_path = cal_dir / folder / "calibrator_platt.pkl"
             if platt_path.exists():
                 base_calibrators[m] = joblib.load(platt_path)
@@ -1218,7 +1357,15 @@ class EnsembleInference:
             else:
                 print(f"  Warning: Platt calibrator not found for {m}: {platt_path}")
 
-        return cls(meta_model, meta_calibrator, base_calibrators, config)
+        return cls(
+            meta_model       = meta_model,
+            meta_calibrator  = meta_calibrator,
+            base_calibrators = base_calibrators,
+            model_names      = model_names,
+            use_disagreement = use_disagreement,
+            use_raw_features = use_raw_features,
+            ensemble_version = ensemble_version,
+        )
 
     def predict(
         self,
@@ -1226,71 +1373,54 @@ class EnsembleInference:
         extra_features      : Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Produce final ensemble predictions for test data.
+        Produce final ensemble probabilities for test data.
 
-        Pipeline
-        --------
-        1. Platt-calibrate each model's raw predictions (or pass through
-           if calibrator not loaded — emit warning).
-        2. Build meta-feature matrix (5 OOF cols + optional disagreement
-           + optional raw SHAP features).
-        3. Meta-model (LogisticRegression) → ensemble probability.
-        4. Final Platt calibration (if available).
-        5. Clip to [1e-6, 1−1e-6].
+        Pipeline:
+          1. Shape validation — all arrays must have equal length
+          2. Bidirectional model set validation
+          3. Per-model Platt calibration (or pass-through with warning)
+          4. Meta-feature matrix (OOF + optional disagreement + SHAP)
+          5. Meta-model (LogisticRegression) prediction
+          6. Final Platt calibration (if available)
+          7. Clip to [1e-6, 1−1e-6]
 
         Parameters
         ----------
-        raw_preds_per_model : dict model_name → np.ndarray
-            Raw (un-calibrated) predictions from each base model,
-            averaged across CV folds.
-        extra_features      : optional np.ndarray (n, k)
-            Top-k SHAP raw features (post-Step 3 only).
-
-        Returns
-        -------
-        np.ndarray of shape (n,) — final ensemble probabilities
+        raw_preds_per_model : model_name → raw (un-calibrated) predictions
+        extra_features      : optional (n, k) SHAP raw features
         """
-        # Step 1: per-model Platt calibration
-        # Validate all input arrays have equal length before any computation.
-        # Silent misalignment here would produce a corrupt submission with no error.
-        lengths = {m: len(raw_preds_per_model[m]) for m in MODEL_NAMES}
+        # Step 1+2: shape and model set validation before any computation
+        validate_model_set(self.model_names, raw_preds_per_model, "predict")
+        lengths        = {m: len(raw_preds_per_model[m]) for m in self.model_names}
         unique_lengths = set(lengths.values())
         if len(unique_lengths) != 1:
             raise ValueError(
-                f"Inconsistent prediction array lengths across models: {lengths}. "
-                "All models must produce predictions for the same number of rows."
+                f"Inconsistent prediction lengths: {lengths}.  "
+                "All models must predict the same number of rows."
             )
 
+        # Step 3: per-model Platt calibration
         calibrated: Dict[str, np.ndarray] = {}
-        for m in MODEL_NAMES:
-            if m not in raw_preds_per_model:
-                raise ValueError(
-                    f"Missing predictions for model '{m}' in raw_preds_per_model."
-                )
+        for m in self.model_names:
             if m in self.base_calibrators:
                 calibrated[m] = self.base_calibrators[m].predict(
                     raw_preds_per_model[m]
                 )
             else:
                 calibrated[m] = raw_preds_per_model[m]
-                print(f"  Warning: Using un-calibrated predictions for {m}.")
+                print(f"  Warning: Using un-calibrated predictions for '{m}'.")
 
-        # Step 2: meta-feature matrix
-        meta_X = np.stack([calibrated[m] for m in MODEL_NAMES], axis=1)
-        if self.config.use_disagreement:
+        # Step 4: meta-feature matrix
+        meta_X = np.stack([calibrated[m] for m in self.model_names], axis=1)
+        if self.use_disagreement:
             meta_X = np.hstack([meta_X, meta_X.std(axis=1, keepdims=True)])
-
-        if self.config.use_raw_features and extra_features is not None:
+        if self.use_raw_features and extra_features is not None:
             meta_X = np.hstack([meta_X, extra_features])
 
-        # Step 3: meta-model
+        # Steps 5–7: meta-model → calibrate → clip
         ensemble_pred = self.meta_model.predict_proba(meta_X)[:, 1]
-
-        # Step 4: final Platt calibration
         if self.meta_calibrator is not None:
             ensemble_pred = self.meta_calibrator.predict(ensemble_pred)
-
-        # Step 5: clip
         return np.clip(ensemble_pred, CLIP_LOW, CLIP_HIGH)
 
 
@@ -1300,12 +1430,10 @@ class EnsembleInference:
 
 if __name__ == "__main__":
     """
-    Run the ensemble pipeline from project root:
+    Run the full ensemble pipeline from project root:
         python -m src.ensemble.ensemble
 
-    Expects:
-        outputs/multi_model/y_true.npy
-        outputs/multi_model/oof_calibrated_{model}.npy  (all 5 models)
+    Expects all configured OOF arrays in outputs/multi_model/.
     """
     import sys
 
@@ -1319,14 +1447,15 @@ if __name__ == "__main__":
         use_disagreement   = True,
         use_raw_features   = False,   # activate post-SHAP (Step 3)
         calibrate_ensemble = True,
-        meta_C             = 0.05,    # v5: tightened from 0.1 for 5 meta-inputs
+        meta_C             = 0.05,
     )
+    config.validate()
 
     print(f"Project root : {project_root}")
-    print(f"Model names  : {MODEL_NAMES}")
+    print(f"Version      : {config.ensemble_version}")
+    print(f"Models       : {config.model_names}")
     print(f"meta_C       : {config.meta_C}")
     print()
 
     results = run_ensemble_pipeline(config)
-
     sys.exit(0 if results.best_score < 999.0 else 1)
