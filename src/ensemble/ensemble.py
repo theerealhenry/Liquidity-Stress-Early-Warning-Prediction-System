@@ -472,7 +472,8 @@ def simple_average(
     baseline — stacking should clearly beat this with r=0.745–0.753
     cross-cluster diversity.
     """
-    pred_arr = np.stack([oof_preds[m] for m in MODEL_NAMES], axis=1)
+    active_models = [m for m in MODEL_NAMES if m in oof_preds]
+    pred_arr = np.stack([oof_preds[m] for m in active_models], axis=1)
     avg_pred = pred_arr.mean(axis=1)
     avg_pred = np.clip(avg_pred, CLIP_LOW, CLIP_HIGH)
     metrics  = evaluate("simple_average", y_true, avg_pred)
@@ -493,6 +494,13 @@ def _weight_objective(
     Projects weights onto the probability simplex (sum=1, all ≥ 0).
     """
     w = np.clip(weights, 0.0, 1.0)
+
+    if w.shape[0] != pred_arr.shape[1]:
+        raise ValueError(
+            f"Weight mismatch: got {w.shape[0]} weights for "
+            f"{pred_arr.shape[1]} models"
+        )
+
     w_sum = w.sum()
     if w_sum < 1e-10:
         return 999.0
@@ -522,6 +530,10 @@ def optimised_weighted_average(
     model_list = list(oof_preds.keys())
     pred_arr = np.stack([oof_preds[m] for m in model_list], axis=1)
     n_models = len(model_list)
+
+    print("pred_arr shape:", pred_arr.shape)
+    print("n_models:", n_models)
+    print("model_list:", model_list)
 
     best_score   = 999.0
     best_weights = np.full(n_models, 1.0 / n_models)
