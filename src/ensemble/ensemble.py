@@ -527,9 +527,16 @@ def optimised_weighted_average(
     slightly optimistic.  The stacking meta-model (Strategy 3) is the
     deployment-safe alternative with honest nested-CV evaluation.
     """
-    model_list = list(oof_preds.keys())
+    model_list = [m for m in MODEL_NAMES if m in oof_preds]
+
+    missing_models = [m for m in MODEL_NAMES if m not in oof_preds]
+    if missing_models:
+        raise ValueError(
+            f"Missing OOF predictions for models: {missing_models}"
+        )
+
     pred_arr = np.stack([oof_preds[m] for m in model_list], axis=1)
-    n_models = len(model_list)
+    n_models = pred_arr.shape[1]
 
     print("pred_arr shape:", pred_arr.shape)
     print("n_models:", n_models)
@@ -583,7 +590,7 @@ def optimised_weighted_average(
     best_pred = np.clip(best_pred, CLIP_LOW, CLIP_HIGH)
     metrics   = evaluate("optimised_weighted_average", y_true, best_pred)
 
-    weight_dict = {m: float(w) for m, w in zip(MODEL_NAMES, best_weights)}
+    weight_dict = {m: float(w) for m, w in zip(model_list, best_weights)}
     print(f"  Optimised weights : {weight_dict}")
     print(f"  Best score        : {best_score:.6f}")
 
