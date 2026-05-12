@@ -639,6 +639,13 @@ def predict_model(
     from src.preprocessing.preprocessing import PreprocessingPipeline
     preproc = PreprocessingPipeline.load(str(preproc_path))
 
+    # Backward compatibility patch for old pickles
+    if not hasattr(preproc, "scale_features"):
+        preproc.scale_features = False
+
+    if not hasattr(preproc, "scaler_"):
+        preproc.scaler_ = None
+
     # Verify scale_features flag matches expectation for this model family.
     # A mismatch (e.g. GBM preprocessor on logreg) would silently corrupt
     # predictions without raising an error.
