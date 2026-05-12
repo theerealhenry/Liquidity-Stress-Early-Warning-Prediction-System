@@ -795,11 +795,29 @@ def calibrate_predictions(
         )
         calibrator = joblib.load(cal_path)
 
+        log.info(
+            "[%s] Loaded calibrator type: %s",
+            model_name.upper(),
+            type(calibrator).__name__,
+        )
+
     # Platt calibrators expect 2D input: (n_samples, 1)
     raw_preds_2d = raw_preds.reshape(-1, 1)
 
-    # sklearn LogisticRegression calibrator
+    # ------------------------------------------------------------------
+    # Backward compatibility fix:
+    # Older sklearn LogisticRegression pickles may miss attributes
+    # like `multi_class` when loaded across sklearn versions.
+    # ------------------------------------------------------------------
     if hasattr(calibrator, "predict_proba"):
+
+        # Patch missing sklearn attributes from old pickles
+        if not hasattr(calibrator, "multi_class"):
+            calibrator.multi_class = "auto"
+
+        if not hasattr(calibrator, "classes_"):
+            calibrator.classes_ = np.array([0, 1])
+
         cal_preds = calibrator.predict_proba(raw_preds_2d)[:, 1]
 
     # custom Platt scaler with .predict()
