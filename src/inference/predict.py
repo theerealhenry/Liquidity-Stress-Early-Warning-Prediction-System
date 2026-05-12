@@ -135,6 +135,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import joblib
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
 import numpy as np
 import pandas as pd
 
@@ -574,7 +576,12 @@ def _load_fold_models(model_name: str, run_dir: Path) -> List:
         if is_tabnet:
             models.append(_load_tabnet_fold(fp))
         else:
-            models.append(joblib.load(fp))
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    category=InconsistentVersionWarning
+                )
+                models.append(joblib.load(fp))
 
     log.info(
         "    Loaded %d %s fold models from %s",
@@ -699,10 +706,12 @@ def predict_model(
 
     X_proc = preproc.transform(X_aligned)
 
-    # Keep feature names for sklearn/lightgbm/xgboost/logreg
-    # Convert ONLY for TabNet if needed
-    if model_name == "tabnet" and isinstance(X_proc, pd.DataFrame):
-        X_proc = X_proc.values
+    # Preserve DataFrame feature names for GBMs to avoid
+    # sklearn/lightgbm feature-name warnings.
+    # TabNet requires numpy input.
+    if model_name == "tabnet":
+        if isinstance(X_proc, pd.DataFrame):
+            X_proc = X_proc.values
     log.info("    Preprocessed shape: %s  scale=%s", X_proc.shape, has_scale)
 
     # 3. Load fold models
@@ -779,7 +788,12 @@ def calibrate_predictions(
             "  Other → 07b_logreg_tabnet_calibration.ipynb"
         )
 
-    calibrator = joblib.load(cal_path)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=InconsistentVersionWarning
+        )
+        calibrator = joblib.load(cal_path)
 
     # Platt calibrators expect 2D input: (n_samples, 1)
     raw_preds_2d = raw_preds.reshape(-1, 1)
