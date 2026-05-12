@@ -375,6 +375,7 @@ class PreprocessingPipeline:
         # ── StandardScaler (scale-sensitive models only) ──────────────────
         # Applied AFTER the contract assertion so we scale exactly the
         # features in the locked order — no shape mismatch possible.
+        
         scale_features = getattr(self, "scale_features", False)
         scaler_fitted  = getattr(self, "scaler_", None)
 
@@ -509,7 +510,18 @@ class PreprocessingPipeline:
         Returns the fully fitted pipeline ready to call transform().
         """
         import joblib
-        pipeline = joblib.load(path)
+        import warnings
+
+        from sklearn.exceptions import InconsistentVersionWarning
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=InconsistentVersionWarning
+            )
+
+            pipeline = joblib.load(path)
+
         print(f"[PreprocessingPipeline] Loaded from {path}")
         return pipeline
 
