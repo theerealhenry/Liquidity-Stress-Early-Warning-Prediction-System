@@ -563,10 +563,10 @@ def _load_tabnet_fold(fold_path: Path):
             "Install with: pip install pytorch-tabnet"
         ) from exc
 
-    # TabNet's load_model() expects the path WITHOUT the .zip extension.
-    path_no_ext = str(fold_path).replace(".zip", "")
     model = TabNetClassifier()
-    model.load_model(path_no_ext)
+
+    model.load_model(str(fold_path))
+
     return model
 
 
