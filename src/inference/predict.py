@@ -142,28 +142,36 @@ import pandas as pd
 
 class PlattCalibrator:
     """
-    Backward-compatible Platt scaling calibrator used by older
-    calibration artefacts.
-
-    Some calibration pickles were saved with this custom class.
-    Newer inference pipelines may not define it anymore, causing:
-
-        AttributeError:
-        Can't get attribute 'PlattCalibrator'
-
-    This lightweight compatibility shim restores the class so
-    old calibration artefacts can be loaded safely.
+    Backward-compatible Platt scaling calibrator.
+    Supports legacy serialized objects.
     """
 
-    def __init__(self, slope=1.0, intercept=0.0):
+    def __init__(self, slope=None, intercept=None):
         self.slope = slope
         self.intercept = intercept
 
     def predict(self, x):
-        x = np.asarray(x, dtype=np.float64)
-        z = self.slope * x + self.intercept
-        return 1.0 / (1.0 + np.exp(-z))
-        
+        # Backward compatibility
+        slope = getattr(self, "slope", None)
+        intercept = getattr(self, "intercept", None)
+
+        # Legacy attribute names
+        if slope is None:
+            slope = getattr(self, "a", None)
+
+        if intercept is None:
+            intercept = getattr(self, "b", None)
+
+        # Fallback safety
+        if slope is None:
+            slope = 1.0
+
+        if intercept is None:
+            intercept = 0.0
+
+        z = slope * x + intercept
+        return 1 / (1 + np.exp(-z))
+    
 # ---------------------------------------------------------------------------
 # Project root — resolved relative to this file, not CWD.
 # Guarantees the same resolution whether called as:
