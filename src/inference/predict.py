@@ -698,8 +698,10 @@ def predict_model(
         X_aligned = X_test
 
     X_proc = preproc.transform(X_aligned)
-    # Ensure numpy array for all model families (CatBoost in particular)
-    if isinstance(X_proc, pd.DataFrame):
+
+    # Keep feature names for sklearn/lightgbm/xgboost/logreg
+    # Convert ONLY for TabNet if needed
+    if model_name == "tabnet" and isinstance(X_proc, pd.DataFrame):
         X_proc = X_proc.values
     log.info("    Preprocessed shape: %s  scale=%s", X_proc.shape, has_scale)
 
@@ -778,7 +780,19 @@ def calibrate_predictions(
         )
 
     calibrator = joblib.load(cal_path)
-    cal_preds = calibrator.predict(raw_preds)
+
+    # Platt calibrators expect 2D input: (n_samples, 1)
+    raw_preds_2d = raw_preds.reshape(-1, 1)
+
+    # sklearn LogisticRegression calibrator
+    if hasattr(calibrator, "predict_proba"):
+        cal_preds = calibrator.predict_proba(raw_preds_2d)[:, 1]
+
+    # custom Platt scaler with .predict()
+    else:
+        cal_preds = calibrator.predict(raw_preds_2d)
+
+    cal_preds = np.asarray(cal_preds).reshape(-1)
     cal_preds = np.clip(cal_preds, CLIP_LOW, CLIP_HIGH)
 
     # Log Platt parameters for traceability.
