@@ -375,7 +375,10 @@ class PreprocessingPipeline:
         # ── StandardScaler (scale-sensitive models only) ──────────────────
         # Applied AFTER the contract assertion so we scale exactly the
         # features in the locked order — no shape mismatch possible.
-        if self.scale_features and self.scaler_ is not None:
+        scale_features = getattr(self, "scale_features", False)
+        scaler_fitted  = getattr(self, "scaler_", None)
+
+        if scale_features and scaler_fitted is not None:
             scaled_values = self.scaler_.transform(df.values)
             df = pd.DataFrame(
                 scaled_values,
@@ -509,6 +512,21 @@ class PreprocessingPipeline:
         pipeline = joblib.load(path)
         print(f"[PreprocessingPipeline] Loaded from {path}")
         return pipeline
+
+    def __setstate__(self, state):
+        """
+        Ensures older serialized pipeline objects remain compatible
+        with newer class versions after unpickling.
+        """
+        self.__dict__.update(state)
+
+        # Added in v2.0
+        if not hasattr(self, "scale_features"):
+            self.scale_features = False
+
+        # Added in v2.0
+        if not hasattr(self, "scaler_"):
+            self.scaler_ = None
 
     # =========================================================================
     # REPR
