@@ -1374,13 +1374,20 @@ def log_all_experiments(
         )
         sys.exit(1)
 
-    # Resolve tracking URI relative to project root
-    if not tracking_uri.startswith(("http", "sqlite")):
-        uri = str(PROJECT_ROOT / tracking_uri)
-    else:
+    from pathlib import Path
+
+    # Resolve tracking URI safely for MLflow
+    if tracking_uri.startswith(("http", "https", "sqlite")):
         uri = tracking_uri
+    else:
+        # Convert local path → absolute file URI (MLflow-compatible)
+        uri = Path(tracking_uri).resolve().as_uri()
 
     mlflow.set_tracking_uri(uri)
+    log.info("Resolved MLflow tracking URI: %s", mlflow.get_tracking_uri())
+    # Force early failure instead of silent cascade
+    if mlflow.get_tracking_uri().startswith("D:\\") or ":" in mlflow.get_tracking_uri().split("/")[0]:
+        raise ValueError(f"Invalid MLflow URI detected: {mlflow.get_tracking_uri()}")
     log.info("=" * 70)
     log.info("AI4EAC MLflow Retrospective Logger")
     log.info("=" * 70)
@@ -1393,7 +1400,13 @@ def log_all_experiments(
 
     if dry_run:
         log.info("\n[DRY RUN] Validating artefact paths ...")
-        _validate_paths()
+        log.info("[DRY RUN] Validating MLflow tracking URI ...")
+
+        test_uri = Path(tracking_uri).resolve().as_uri() \
+            if not tracking_uri.startswith(("http", "https", "sqlite")) \
+            else tracking_uri
+
+        log.info("  MLflow URI would be: %s", test_uri)
         log.info("[DRY RUN] Path validation complete.  Nothing logged.")
         return
 
