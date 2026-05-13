@@ -825,6 +825,10 @@ def calibrate_predictions(
             "ignore",
             category=InconsistentVersionWarning
         )
+
+        import __main__
+        __main__.PlattCalibrator = PlattCalibrator
+        
         calibrator = joblib.load(cal_path)
 
         log.info(
