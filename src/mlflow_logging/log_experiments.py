@@ -261,6 +261,7 @@ def _log_artifact_if_exists(path: Path) -> None:
 
 def _log_artifacts_in_dir(directory: Path, extensions: List[str]) -> None:
     """Log all files matching extensions in a directory."""
+
     import mlflow
     if not directory.exists():
         return
@@ -268,7 +269,16 @@ def _log_artifacts_in_dir(directory: Path, extensions: List[str]) -> None:
         for fp in sorted(directory.glob(f"*{ext}")):
             mlflow.log_artifact(str(fp))
 
-
+def _common_tags() -> Dict[str, str]:
+    """
+    Shared tags applied to all MLflow runs.
+    """
+    return {
+        "project_name"   : "AI4EAC Liquidity Stress Early Warning",
+        "project_version": "v5.1",
+        "git_branch"     : "main",
+        "author"         : "Henry Otsyula",
+    }
 # =============================================================================
 # EXPERIMENT 1 — BASELINE MODELS
 # =============================================================================
@@ -306,7 +316,9 @@ def log_baseline_models(mlflow) -> None:
         with mlflow.start_run(run_name=run_name):
             # ── Tags ──────────────────────────────────────────────────────
             mlflow.set_tags({
+                **_common_tags(),
                 "model_family"   : model_name,
+                "estimator_type" : "gradient_boosting",
                 "stage"          : "baseline",
                 "training_phase" : "Phase 2a — GBM baseline",
                 "run_dir"        : str(run_dir),
@@ -315,6 +327,7 @@ def log_baseline_models(mlflow) -> None:
                 "positive_rate"  : "0.15",
                 "scale_pos_weight": "5.6667",
                 "feature_version": "v2.2.1 (825 features)",
+                "metric_direction": "lower_is_better",
             })
 
             # ── Hyperparameters from config ────────────────────────────────
@@ -372,7 +385,7 @@ def log_baseline_models(mlflow) -> None:
                             "cv_logloss_std", "cv_auc_std"]:
                     val = metadata.get(key) or metadata.get("cv_results", {}).get(key)
                     if val is not None:
-                        mlflow.log_metric(f"meta_{key}", float(val))
+                        mlflow.log_metric(f"diagnostic_{key}", float(val))
 
             # ── Known post-Platt scores (from handoff) ────────────────────
             ref = _BASELINE_SCORES.get(model_name, {})
@@ -474,7 +487,9 @@ def log_tuning(mlflow) -> None:
 
         with mlflow.start_run(run_name=run_name):
             mlflow.set_tags({
+                **_common_tags(),
                 "model_family"   : model_name,
+                "metric_direction": "lower_is_better",
                 "stage"          : "v2_feature_expansion",
                 "tuning_method"  : "Optuna TPE",
                 "n_trials"       : "100",
@@ -598,6 +613,7 @@ def log_extended_models(mlflow) -> None:
     extended_models = [
         {
             "model_name"   : "logreg",
+            "estimator_type": "linear_model",
             "run_dir"      : _MODEL_RUN_DIRS["logreg"],
             "config_file"  : "logreg_v1.yaml",
             "description"  : "ElasticNet LogReg — linear boundary, orthogonal to GBMs",
@@ -608,6 +624,7 @@ def log_extended_models(mlflow) -> None:
         },
         {
             "model_name"   : "tabnet",
+            "estimator_type": "neural_network",
             "run_dir"      : _MODEL_RUN_DIRS["tabnet"],
             "config_file"  : "tabnet_v1.yaml",
             "description"  : "TabNet — instance-wise sequential attention",
@@ -626,6 +643,7 @@ def log_extended_models(mlflow) -> None:
 
         with mlflow.start_run(run_name=run_name):
             mlflow.set_tags({
+                **_common_tags(),
                 "model_family"   : model_name,
                 "stage"          : "v3_extended_models",
                 "training_phase" : "Phase 2b — Extended models",
@@ -755,6 +773,7 @@ def log_calibration(mlflow) -> None:
             ref   = _BASELINE_SCORES[model_name]
 
             mlflow.set_tags({
+                **_common_tags(),
                 "model_family"     : model_name,
                 "calibration_method": "Platt scaling (sklearn LogisticRegression)",
                 "calibration_cv"   : "5-fold stratified",
@@ -883,6 +902,9 @@ def log_ensemble(mlflow) -> None:
     # Log a parent run for the entire v5.1 ensemble
     with mlflow.start_run(run_name="v5.1-ensemble-summary") as parent_run:
         mlflow.set_tags({
+            **_common_tags(),
+            "estimator_type"    : "ensemble",
+            "metric_direction"  : "lower_is_better",
             "ensemble_version"  : "v5.1",
             "training_phase"    : "Phase 5 — 5-model ensemble",
             "best_strategy"     : "optimised_weighted_average",
@@ -933,7 +955,9 @@ def log_ensemble(mlflow) -> None:
 
             with mlflow.start_run(run_name=display_name, nested=True):
                 mlflow.set_tags({
+                    **_common_tags(),
                     "strategy"         : strategy,
+                    "metric_direction" : "lower_is_better",
                     "is_best_strategy" : str(is_best),
                     "ensemble_version" : "v5.1",
                     "model_count"      : "5",
@@ -1027,6 +1051,7 @@ def log_ensemble(mlflow) -> None:
 
     with mlflow.start_run(run_name="ablation-study-v5.1"):
         mlflow.set_tags({
+            **_common_tags(),
             "training_phase": "Phase 6 — Ablation study",
             "baseline_score": str(_ENSEMBLE_BEST_SCORE),
             "conclusion"    : "0.19144 is structurally stable — no subset or C sweep beat it",
@@ -1072,14 +1097,16 @@ def log_shap(mlflow) -> None:
            Root cause: unscaled features (balance_slope ±40,000) caused
            K≥20 to catastrophically collapse the meta-model.
     """
-    exp_name = "AI4EAC/6_shap_interpretability"
+    exp_name = "AI4EAC/06_shap_interpretability_and_failure_analysis"
     mlflow.set_experiment(exp_name)
     log.info("\n[Exp 6] %s", exp_name)
 
     # ── 6A: SHAP interpretability ─────────────────────────────────────────
     with mlflow.start_run(run_name="shap-xgboost-825-features"):
         mlflow.set_tags({
+            **_common_tags(),
             "model_used"        : "XGBoost v6 (825 features)",
+            "metric_direction"  : "lower_is_better",
             "shap_method"       : "TreeExplainer, interventional perturbation",
             "background_n"      : "500",
             "sample_n"          : "5000",
@@ -1151,6 +1178,7 @@ def log_shap(mlflow) -> None:
 
     with mlflow.start_run(run_name="shap-augmentation-sweep"):
         mlflow.set_tags({
+            **_common_tags(),
             "training_phase": "Phase 8 — SHAP augmentation",
             "conclusion"    : (
                 "ALL K values failed to beat 0.19144. "
@@ -1245,6 +1273,7 @@ def log_final_submission(mlflow) -> None:
 
     with mlflow.start_run(run_name="final-submission-v5.1-ensemble"):
         mlflow.set_tags({
+            **_common_tags(),
             "competition"        : "AI for Economic Activity Challenge (AI4EAC) — Zindi Africa",
             "author"             : "Henry Otsyula",
             "final_submission"   : "true",
@@ -1254,6 +1283,7 @@ def log_final_submission(mlflow) -> None:
             "submission_format"  : "ID,Target,TargetLogLoss,TargetRAUC (all three identical)",
             "test_rows"          : "30000",
             "metric_formula"     : "0.6 × LogLoss + 0.4 × (1 − AUC)",
+            "metric_direction"   : "lower_is_better",
             "weights_source"     : "outputs/experiments/v5_ensemble/run_20260508_054540/ensemble_weights.json",
             "training_data"      : "40000 customers × 183 raw features",
             "feature_engineering": "v2.2.1 — 825 engineered features",
@@ -1358,6 +1388,9 @@ def log_all_experiments(
     log.info("Project root  : %s", PROJECT_ROOT)
     log.info("Dry run       : %s", dry_run)
 
+    actual_uri = mlflow.get_tracking_uri()
+    log.info("Resolved MLflow tracking URI: %s", actual_uri)
+
     if dry_run:
         log.info("\n[DRY RUN] Validating artefact paths ...")
         _validate_paths()
@@ -1399,11 +1432,21 @@ def log_all_experiments(
         log.info("\n%s", "─" * 60)
         log.info("Running experiment %s — %s", key, name)
         log.info("─" * 60)
+
+         # Safety cleanup: prevent active-run collisions
+        if mlflow.active_run():
+            log.warning("Active MLflow run detected. Closing it first.")
+            mlflow.end_run()
         try:
             logger_fn(mlflow)
         except Exception as exc:
             log.error("  FAILED: %s  —  %s", name, exc, exc_info=True)
             failed.append((key, name, str(exc)))
+
+        finally:
+            # Ensure no dangling runs remain open
+            if mlflow.active_run():
+                mlflow.end_run()
 
     runtime = time.perf_counter() - start_time
 
