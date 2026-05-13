@@ -285,26 +285,21 @@ def _common_tags() -> Dict[str, str]:
 
 def log_baseline_models(mlflow) -> None:
     """
-    Log the 3 GBM baseline runs.
-
-    Each run shows: config hyperparameters, per-fold CV metrics,
-    OOF prediction distribution, feature importance top-10,
-    and calibration before/after comparison.
-
-    All 3 GBMs are logged under the same experiment so they appear
-    side-by-side in the MLflow comparison table.
+    Log the 3 GBM baseline runs with clean MLflow structure.
     """
+
     exp_name = "AI4EAC/1_baseline_models"
     mlflow.set_experiment(exp_name)
     log.info("\n[Exp 1] %s", exp_name)
 
     baseline_models = [
-        ("lightgbm", "lgbm_v2.yaml",    _MODEL_RUN_DIRS["lightgbm_baseline"]),
-        ("xgboost",  "xgb_v2.yaml",     _MODEL_RUN_DIRS["xgboost_baseline"]),
+        ("lightgbm", "lgbm_v2.yaml",     _MODEL_RUN_DIRS["lightgbm_baseline"]),
+        ("xgboost",  "xgb_v2.yaml",      _MODEL_RUN_DIRS["xgboost_baseline"]),
         ("catboost", "catboost_v2.yaml", _MODEL_RUN_DIRS["catboost_baseline"]),
     ]
 
     for model_name, config_file, model_dir in baseline_models:
+
         run_dir = _most_recent_run(model_dir) if model_dir.is_dir() else model_dir
         if run_dir is None:
             log.warning("  No run directory found for %s baseline — skipping.", model_name)
@@ -313,121 +308,153 @@ def log_baseline_models(mlflow) -> None:
         run_name = f"{model_name}-baseline"
         log.info("  Logging run: %s  (%s)", run_name, run_dir.name)
 
-        with mlflow.start_run(run_name=run_name):
-            # ── Tags ──────────────────────────────────────────────────────
+        # 🔥 IMPORTANT: isolate each model safely
+        with mlflow.start_run(run_name=run_name, nested=True):
+
+            # ─────────────────────────────────────────────
+            # Tags
+            # ─────────────────────────────────────────────
             mlflow.set_tags({
                 **_common_tags(),
-                "model_family"   : model_name,
-                "estimator_type" : "gradient_boosting",
-                "stage"          : "baseline",
-                "training_phase" : "Phase 2a — GBM baseline",
-                "run_dir"        : str(run_dir),
-                "n_folds"        : "5",
-                "dataset"        : "AI4EAC Train.csv (40000 × 184)",
-                "positive_rate"  : "0.15",
-                "scale_pos_weight": "5.6667",
-                "feature_version": "v2.2.1 (825 features)",
-                "metric_direction": "lower_is_better",
+                "model_family": model_name,
+                "estimator_type": "gradient_boosting",
+                "stage": "baseline",
+                "run_dir": str(run_dir),
+                "n_folds": "5",
             })
 
-            # ── Hyperparameters from config ────────────────────────────────
+            # ─────────────────────────────────────────────
+            # Config params (SAFE logging, no duplicates)
+            # ─────────────────────────────────────────────
             config = _read_yaml(PROJECT_ROOT / "configs" / config_file)
+
             if config:
                 model_params = config.get("model", {}).get("params", {})
-                for k, v in model_params.items():
-                    try:
-                        mlflow.log_param(k, v)
-                    except Exception:
-                        mlflow.log_param(k, str(v))
-                mlflow.log_param("n_estimators",
-                                 config.get("model", {}).get("n_estimators", "N/A"))
 
-            # Also log from config_used.yaml in run dir (ground truth)
+                for k, v in model_params.items():
+                    if v is None:
+                        v = "N/A"
+
+                    mlflow.log_param(f"cfg_{k}", v)
+
+            # ⚠️ REMOVE DUPLICATE LOGGING OF n_estimators
+            # (this was causing your crash)
+
+            # ─────────────────────────────────────────────
+            # Run-specific config
+            # ─────────────────────────────────────────────
             config_used = _read_yaml(run_dir / "config_used.yaml")
+
             if config_used:
-                run_params = (config_used.get("model", {}).get("params", {})
-                              or config_used.get("params", {}))
+                run_params = (
+                    config_used.get("model", {}).get("params", {})
+                    or config_used.get("params", {})
+                )
+
                 for k, v in run_params.items():
                     try:
                         mlflow.log_param(f"run_{k}", v)
                     except Exception:
                         pass
 
-            # ── CV metrics from fold_scores.json ─────────────────────────
+            # ─────────────────────────────────────────────
+            # CV metrics
+            # ─────────────────────────────────────────────
             fold_scores = _read_json(run_dir / "fold_scores.json")
+
             if fold_scores:
-                logloss_vals = [fold_scores.get(f"fold_{k}", {}).get("logloss", None)
-                                for k in range(5)]
-                auc_vals     = [fold_scores.get(f"fold_{k}", {}).get("auc", None)
-                                for k in range(5)]
-                logloss_vals = [v for v in logloss_vals if v is not None]
-                auc_vals     = [v for v in auc_vals     if v is not None]
+                logloss_vals, auc_vals = [], []
+
+                for k in range(5):
+                    f = fold_scores.get(f"fold_{k}", {})
+                    if "logloss" in f:
+                        logloss_vals.append(f["logloss"])
+                    if "auc" in f:
+                        auc_vals.append(f["auc"])
 
                 if logloss_vals:
                     mlflow.log_metric("cv_logloss_mean", np.mean(logloss_vals))
-                    mlflow.log_metric("cv_logloss_std",  np.std(logloss_vals))
-                    for k, v in enumerate(logloss_vals):
-                        mlflow.log_metric("cv_logloss_fold", v, step=k)
+                    mlflow.log_metric("cv_logloss_std", np.std(logloss_vals))
+
                 if auc_vals:
                     mlflow.log_metric("cv_auc_mean", np.mean(auc_vals))
-                    mlflow.log_metric("cv_auc_std",  np.std(auc_vals))
-                    for k, v in enumerate(auc_vals):
-                        mlflow.log_metric("cv_auc_fold", v, step=k)
+                    mlflow.log_metric("cv_auc_std", np.std(auc_vals))
 
                 if logloss_vals and auc_vals:
-                    composite = _composite(np.mean(logloss_vals), np.mean(auc_vals))
-                    mlflow.log_metric("composite_score", composite)
+                    mlflow.log_metric(
+                        "composite_score",
+                        _composite(np.mean(logloss_vals), np.mean(auc_vals))
+                    )
 
-            # ── Fallback to metadata.json ──────────────────────────────────
+            # ─────────────────────────────────────────────
+            # Metadata fallback
+            # ─────────────────────────────────────────────
             metadata = _read_json(run_dir / "metadata.json")
+
             if metadata:
-                for key in ["cv_logloss_mean", "cv_auc_mean", "composite_score",
-                            "cv_logloss_std", "cv_auc_std"]:
-                    val = metadata.get(key) or metadata.get("cv_results", {}).get(key)
-                    if val is not None:
-                        mlflow.log_metric(f"diagnostic_{key}", float(val))
+                for key in ["cv_logloss_mean", "cv_auc_mean", "composite_score"]:
+                    if key in metadata:
+                        mlflow.log_metric(f"diagnostic_{key}", float(metadata[key]))
 
-            # ── Known post-Platt scores (from handoff) ────────────────────
+            # ─────────────────────────────────────────────
+            # Reference scores
+            # ─────────────────────────────────────────────
             ref = _BASELINE_SCORES.get(model_name, {})
+
             if ref:
-                mlflow.log_metric("oof_logloss_platt",    ref["logloss"])
-                mlflow.log_metric("oof_auc_platt",         ref["auc"])
-                mlflow.log_metric("oof_composite_platt",   ref["composite"])
+                mlflow.log_metric("oof_logloss_platt", ref["logloss"])
+                mlflow.log_metric("oof_auc_platt", ref["auc"])
+                mlflow.log_metric("oof_composite_platt", ref["composite"])
 
-            # ── OOF prediction distribution ────────────────────────────────
+            # ─────────────────────────────────────────────
+            # OOF stats
+            # ─────────────────────────────────────────────
             oof_stats = _npy_stats(run_dir / "oof_preds.npy")
+
             if oof_stats:
-                for stat, val in oof_stats.items():
-                    mlflow.log_metric(f"oof_raw_{stat}", val)
+                for k, v in oof_stats.items():
+                    mlflow.log_metric(f"oof_raw_{k}", v)
 
-            # ── Calibrated OOF stats (from multi_model dir) ───────────────
             cal_stats = _npy_stats(_MULTI_MODEL / f"oof_calibrated_{model_name}.npy")
+
             if cal_stats:
-                for stat, val in cal_stats.items():
-                    mlflow.log_metric(f"oof_cal_{stat}", val)
+                for k, v in cal_stats.items():
+                    mlflow.log_metric(f"oof_cal_{k}", v)
 
-            # ── Platt calibration parameters ──────────────────────────────
+            # ─────────────────────────────────────────────
+            # Platt calibration
+            # ─────────────────────────────────────────────
             platt = _PLATT_PARAMS.get(model_name, {})
-            if platt:
-                mlflow.log_metric("platt_slope",         platt["slope"])
-                mlflow.log_metric("platt_intercept",     platt["intercept"])
-                mlflow.log_metric("ll_reduction_pct",    platt["ll_reduction_pct"])
 
-            # ── Cross-cluster correlation (vs other GBMs) ─────────────────
+            if platt:
+                mlflow.log_metric("platt_slope", platt["slope"])
+                mlflow.log_metric("platt_intercept", platt["intercept"])
+                mlflow.log_metric("ll_reduction_pct", platt["ll_reduction_pct"])
+
+            # ─────────────────────────────────────────────
+            # Correlations
+            # ─────────────────────────────────────────────
             for (m1, m2), corr in _OOF_CORRELATIONS.items():
                 if model_name in (m1, m2):
                     other = m2 if m1 == model_name else m1
                     mlflow.log_metric(f"oof_corr_{other}", corr)
 
-            # ── Artefacts ──────────────────────────────────────────────────
+            # ─────────────────────────────────────────────
+            # Artifacts
+            # ─────────────────────────────────────────────
             _log_artifact_if_exists(run_dir / "feature_importance.csv")
             _log_artifact_if_exists(run_dir / "fold_scores.json")
             _log_artifact_if_exists(run_dir / "metadata.json")
+
             _log_artifacts_in_dir(
-                _CALIB_DIR / {"lightgbm": "lgb", "xgboost": "xgb",
-                              "catboost": "cat"}[model_name],
+                _CALIB_DIR / {
+                    "lightgbm": "lgb",
+                    "xgboost": "xgb",
+                    "catboost": "cat"
+                }[model_name],
                 [".pkl", ".npy"]
             )
+
             _log_artifact_if_exists(
                 _CALIB_DIR / "reliability_diagrams_logreg_tabnet.png"
             )
@@ -1386,8 +1413,11 @@ def log_all_experiments(
     mlflow.set_tracking_uri(uri)
     log.info("Resolved MLflow tracking URI: %s", mlflow.get_tracking_uri())
     # Force early failure instead of silent cascade
-    if mlflow.get_tracking_uri().startswith("D:\\") or ":" in mlflow.get_tracking_uri().split("/")[0]:
-        raise ValueError(f"Invalid MLflow URI detected: {mlflow.get_tracking_uri()}")
+    from urllib.parse import urlparse
+    parsed = urlparse(mlflow.get_tracking_uri())
+    if parsed.scheme not in ("file", "http", "https", "sqlite", ""):
+        raise ValueError(f"Unsupported MLflow URI scheme: {parsed.scheme}")
+    
     log.info("=" * 70)
     log.info("AI4EAC MLflow Retrospective Logger")
     log.info("=" * 70)
