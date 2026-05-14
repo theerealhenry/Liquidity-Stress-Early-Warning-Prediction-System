@@ -68,7 +68,7 @@ model:
   params:
     booster: gbtree
 
-    # 🔥 FIX: explicitly define base_score as clean float
+    # fix: explicitly define base_score as clean float
     base_score: 0.5
 
     colsample_bylevel: 0.8043398580939569
