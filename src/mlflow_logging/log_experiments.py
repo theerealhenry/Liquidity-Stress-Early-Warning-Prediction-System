@@ -61,7 +61,7 @@ Usage
   # Then open: http://localhost:5000
 
   # Options:
-  python -m src.mlflow_logging.log_experiments --tracking-uri ./mlruns
+  python -m src.mlflow_logging.log_experiments --tracking-uri ./sqlite:///mlflow.db
   python -m src.mlflow_logging.log_experiments --experiment 5_ensemble
   python -m src.mlflow_logging.log_experiments --dry-run
 
@@ -1376,7 +1376,7 @@ def log_final_submission(mlflow) -> None:
 # =============================================================================
 
 def log_all_experiments(
-    tracking_uri : str  = "./mlruns",
+    tracking_uri : str  = "sqlite:///mlflow.db",
     experiments  : Optional[List[str]] = None,
     dry_run      : bool = False,
 ) -> None:
@@ -1385,8 +1385,8 @@ def log_all_experiments(
 
     Parameters
     ----------
-    tracking_uri : where MLflow stores runs.  Defaults to ./mlruns
-                   in the project root.
+    tracking_uri : where MLflow stores runs.  Defaults to sqlite:///mlflow.db
+
     experiments  : list of experiment numbers/names to run, e.g.
                    ["1", "5", "7"].  None = run all.
     dry_run      : if True, validates paths but logs nothing.
@@ -1543,8 +1543,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tracking-uri",
-        default = "./mlruns",
-        help    = "MLflow tracking URI (default: ./mlruns in project root)",
+        default = "sqlite:///mlflow.db",
+        help    = "MLflow tracking URI (default: sqlite:///mlflow.db in project root)",
     )
     parser.add_argument(
         "--experiment",
