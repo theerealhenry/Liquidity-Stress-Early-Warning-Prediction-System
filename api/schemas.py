@@ -424,7 +424,7 @@ class PredictionMetadata(BaseModel):
     feature_count: int = Field(
         default=825,
         description=(
-            "Number of engineered features passed to the ensemble models.  "
+            "Number of engineered features passed to the ensemble models.  " 
             "Production value is 825 (184 raw → 826 total → 825 after ID drop)."
         ),
     )
@@ -1784,3 +1784,42 @@ def assert_schema_integrity() -> None:
 # the service will fail to start with a clear message rather than silently
 # producing wrong predictions.
 assert_schema_integrity()
+
+if __name__ == "__main__":
+    print("Running schema self-test...")
+
+    sample = CustomerFeatures(
+        ID="CUST_001",
+        gender="male",
+        region="nairobi",
+        segment="youth",
+        earning_pattern="salary",
+        smartphone="yes",
+        age=30,
+        x_90_d_activity_rate=0.85,
+        arpu=1200.0,
+
+        m1_daily_avg_bal=5000.0,
+        m6_daily_avg_bal=8000.0,
+
+        m1_deposit_total_value=10000.0,
+        m1_deposit_highest_amount=4000.0,
+
+        m6_deposit_total_value=30000.0,
+
+        m1_received_total_value=1000.0,
+        m1_transfer_from_bank_total_value=500.0,
+
+        m6_received_total_value=10000.0,
+        m6_transfer_from_bank_total_value=5000.0,
+    )
+
+    print(sample)
+    print(sample.computed_input_summary)
+
+    df = sample.to_dataframe()
+    print(df.head())
+
+    print("balance_lag_detected =", sample.balance_lag_detected)
+
+    print("Schema self-test completed successfully.")
